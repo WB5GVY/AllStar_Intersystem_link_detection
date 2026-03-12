@@ -225,7 +225,7 @@ class AutoDisconnector:
             "-p", str(managed.ssh_port),
             "-i", str(Path(managed.ssh_key).expanduser()),
             f"{managed.ssh_user}@{managed.ssh_host}",
-            f'asterisk -rx "{asterisk_cmd}"',
+            f'/usr/sbin/asterisk -rx "{asterisk_cmd}"',
         ]
 
         logger.info(f"SSH command: asterisk -rx \"{asterisk_cmd}\" on {managed.ssh_host}")
