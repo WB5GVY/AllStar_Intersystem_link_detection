@@ -158,12 +158,12 @@ class Notifier:
           - Max N per day across all paths
           - Per-path cooldown: same violation path won't re-notify within window
 
+        Note: quiet hours are NOT checked here — they are applied selectively
+        in notify() so that offender emails are always sent regardless of
+        quiet hours, while sys admin emails are suppressed during quiet hours.
+
         Returns (allowed, reason).
         """
-        # Check quiet hours
-        if self.is_quiet_hours():
-            return False, "quiet hours"
-
         # Check per-window limit (all paths combined)
         window_min = self.rate_limits.get("window_minutes", 15)
         max_per_window = self.rate_limits.get("max_per_window", 2)
@@ -190,11 +190,15 @@ class Notifier:
     def notify(self, scan_result: ScanResult) -> int:
         """Send notifications for all bridging events in a scan result.
 
+        Quiet hours suppress sys admin emails but NOT offender courtesy emails.
+        Rate limits apply to all notifications regardless of quiet hours.
+
         Returns the number of notifications actually sent.
         """
         if not scan_result.has_problems:
             return 0
 
+        quiet = self.is_quiet_hours()
         sent_count = 0
         for event in scan_result.bridging_events:
             allowed, reason = self.can_notify(event)
@@ -202,26 +206,32 @@ class Notifier:
                 logger.info(f"Notification suppressed for node {event.offending_node}: {reason}")
                 continue
 
-            success = self._send_notification(event, scan_result)
+            success = self._send_notification(event, scan_result, quiet)
             if success:
                 self.tracker.record_notification(event)
                 sent_count += 1
 
         return sent_count
 
-    def _send_notification(self, event: BridgingEvent, scan_result: ScanResult) -> bool:
+    def _send_notification(self, event: BridgingEvent, scan_result: ScanResult,
+                           quiet: bool = False) -> bool:
         """Send notification via all enabled channels. Returns True if any succeeded."""
         any_success = False
 
         if self.email_config.get("enabled", False):
-            if self._send_email(event, scan_result):
-                any_success = True
+            if quiet:
+                logger.info(f"Sys admin email suppressed for node {event.offending_node}: quiet hours")
+            else:
+                if self._send_email(event, scan_result):
+                    any_success = True
 
         # Send courtesy email to offending operator via QRZ lookup
+        # Always sent regardless of quiet hours
         if self.qrz and self.email_config.get("enabled", False):
             self._notify_offender(event, scan_result)
+            any_success = True
 
-        # If no channels enabled, just log
+        # If no channels produced output, just log
         if not any_success:
             logger.warning(f"NOTIFICATION (no channels enabled): {event}")
             # Still count as "sent" for rate limiting so we don't spam logs
