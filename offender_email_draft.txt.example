@@ -1,0 +1,33 @@
+Hello {offender_name} ({callsign}),
+
+This is an automated notice from the MYCALL Repeater System.
+
+Our monitoring system has detected that your node {offending_node}
+is currently (or was recently) connected to the MYCALL system while
+also having a connection to another AllStarLink network node:
+
+  Connection path: {path_description}
+
+Such bridging can create confusion and chaos unless previously
+discussed and authorized by the MYCALL Trustee and thus is frowned upon.
+
+When connecting to the MYCALL system always "Disconnect before Connect",
+unless you have received the MYCALL Trustee's prior blessing. This will
+ensure that your node has no other active connections when linking
+to our repeater system.
+
+It's possible we have already disconnected your node. You are welcome
+to reconnect after clearing your other connections.
+
+You are encouraged to connect via either of our designated gateway/hub
+Nodes: ZZZZZ or YYYYY.
+
+If you believe this notice was sent in error, or if you have
+questions, please contact the MYCALL Repeater Support Team (see below).
+
+73,
+the MYCALL Repeater Support Team
+See contact emails at:
+https://www.qrz.com/db/TRUSTEE_CALL (MYCALL Trustee)
+https://www.qrz.com/db/ADMIN1_CALL (sys admin for gateway/hub node YYYYY)
+https://www.qrz.com/db/ADMIN2_CALL (sys admin for gateway/hub node ZZZZZ)
