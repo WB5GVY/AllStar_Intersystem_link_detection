@@ -1,0 +1,46 @@
+# Credentials and runtime config
+config.yaml
+secrets.yaml
+
+# Live offender email template
+offender_email_draft.txt
+
+# Development docs
+ASL_LinkDetection_Journal.md
+ASL_LinkDetection_Plan.md
+
+# Runtime data
+notifications.db
+notifications.db-journal
+
+# Log files
+*.log
+
+# Bubble map images (fetched at runtime)
+*.jpg
+*.jpeg
+*.png
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# macOS
+.DS_Store
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Virtual environments
+venv/
+.venv/
+env/

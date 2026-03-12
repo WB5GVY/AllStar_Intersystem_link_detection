@@ -1,0 +1,94 @@
+# AllStar Intersystem Link Detection — Example Configuration
+# Copy this file to config.yaml and fill in your values.
+# See README.md for documentation.
+
+# Your system topology
+#
+# Focus node: the central hub node to monitor
+focus_node: XXXXX     # Replace with your hub node number
+#
+# Bridge nodes: permitted to have ONE guest node beyond them.
+# Regular 1-hop nodes (anything else connected to the focus) must be leaf endpoints.
+bridge_nodes:
+  - YYYYY   # Example: radioless bridge node
+  - ZZZZZ   # Example: secondary hub/bridge
+  - WWWWW   # Example: EchoLink gateway
+#
+# Detection rules:
+#   - Any node ≥3 hops from focus = ALWAYS problematic
+#   - Non-bridge 1-hop node with anything beyond it = problematic (hop 2 is offender)
+#   - Bridge node with >1 hop beyond it = problematic (hop 3 is offender)
+
+# Nodes that are explicitly allowed beyond normal limits (e.g., known legitimate).
+allowlist: []
+
+# How often to poll the AllStarLink Stats API (seconds).
+# The API allows 30 req/min aggregate; a 5-min interval is very conservative.
+poll_interval_seconds: 300
+
+# Consider a linked node "stale" if its regseconds timestamp is older than
+# this many minutes. Stale links are skipped (not flagged as bridging).
+# Note: the stats API's regseconds can lag ~60 min behind the live registration
+# server, so this threshold should be generous.
+stale_threshold_minutes: 120
+
+# Logging
+logging:
+  level: INFO          # DEBUG, INFO, WARNING, ERROR
+  file: asl_link_detector.log
+  max_bytes: 5242880   # 5 MB
+  backup_count: 3      # Keep 3 rotated log files
+
+# Secrets file — credentials stored separately (owner-read-only, chmod 600).
+# See secrets.yaml.example for the format.
+secrets_file: "~/.config/asl_link_detector/secrets.yaml"
+
+# Email notification via SMTP
+notifications:
+  email:
+    enabled: true
+    smtp_server: smtp.gmail.com
+    smtp_port: 587
+    use_tls: true
+    # username, password, from_addr, recipients loaded from secrets_file
+    subject_prefix: "[ASL Link Alert]"
+
+# Notification rate limiting
+rate_limits:
+  max_per_window: 2          # Max notifications per window across all paths
+  window_minutes: 15          # Window size in minutes
+  max_per_day: 24             # Max notifications per day across all paths
+  cooldown_per_path_minutes: 15  # Same violation path won't re-notify within this period
+
+# Quiet hours — notifications are suppressed (events still logged)
+quiet_hours:
+  enabled: true
+  start: "22:00"
+  end: "07:00"
+  timezone: "America/Chicago"
+
+# Auto-disconnect: SSH into managed nodes to force-disconnect offenders.
+# Each node listed here must have SSH key access from this machine.
+# Only nodes with enabled: true will be acted on.
+auto_disconnect:
+  reverify_delay_seconds: 15   # Wait this long, then re-check before disconnecting
+  nodes:
+    - node_id: YYYYY           # Replace with your managed node number
+      ssh_host: "192.168.x.x"  # Replace with your node's IP address
+      ssh_user: "root"          # SSH username on the AllStar node
+      ssh_key: "~/.ssh/id_your_key"  # Path to SSH private key
+      ssh_port: 22              # SSH port (default 22)
+      enabled: false            # Set to true after testing
+
+# QRZ.com callsign lookup — looks up offending operator's email to send courtesy notice
+# Credentials loaded from secrets_file
+qrz:
+  enabled: false               # Requires QRZ XML subscription
+
+# Voice announcement injection (not yet implemented)
+voice_announcement:
+  enabled: false
+  ssh_host: ""
+  ssh_user: "repeater"
+  ssh_key: "~/.ssh/id_rsa"
+  announce_node: YYYYY
