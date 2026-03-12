@@ -26,6 +26,15 @@ allowlist: []
 # The API allows 30 req/min aggregate; a 5-min interval is very conservative.
 poll_interval_seconds: 300
 
+# Aggressive polling near top of each hour.
+# Nets typically start at :00, so offenders are more likely to connect
+# in the minutes just before and after the hour.
+top_of_hour_polling:
+  enabled: true
+  interval_seconds: 15     # Poll every 15s during the window
+  before_minutes: 5        # Start aggressive polling at :55
+  after_minutes: 10        # End aggressive polling at :10
+
 # Consider a linked node "stale" if its regseconds timestamp is older than
 # this many minutes. Stale links are skipped (not flagged as bridging).
 # Note: the stats API's regseconds can lag ~60 min behind the live registration

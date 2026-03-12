@@ -8,6 +8,7 @@ offender_email_draft.txt
 # Development docs
 ASL_LinkDetection_Journal.md
 ASL_LinkDetection_Plan.md
+node_*_changes*.md
 
 # Runtime data
 notifications.db

@@ -18,6 +18,7 @@ import logging.handlers
 import signal
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -269,13 +270,38 @@ def main():
         else:
             # Continuous monitoring loop
             interval = config.get("poll_interval_seconds", 300)
-            logger.info(f"Entering continuous monitoring (every {interval}s). Ctrl+C to stop.")
+            # Aggressive polling near top of hour (nets typically start at :00)
+            top_of_hour = config.get("top_of_hour_polling", {})
+            toh_enabled = top_of_hour.get("enabled", True)
+            toh_interval = top_of_hour.get("interval_seconds", 15)
+            toh_before_minutes = top_of_hour.get("before_minutes", 5)
+            toh_after_minutes = top_of_hour.get("after_minutes", 10)
+
+            if toh_enabled:
+                logger.info(
+                    f"Entering continuous monitoring (normal: {interval}s, "
+                    f"top-of-hour: {toh_interval}s from :{60-toh_before_minutes:02d} "
+                    f"to :{toh_after_minutes:02d}). Ctrl+C to stop."
+                )
+            else:
+                logger.info(f"Entering continuous monitoring (every {interval}s). Ctrl+C to stop.")
 
             while not _shutdown:
                 run_scan(analyzer, notifier, disconnector, focus_node,
                          enable_image_crosscheck=enable_image)
+
+                # Determine sleep interval based on proximity to top of hour
+                now = datetime.now()
+                minutes_in_hour = now.minute
+                if (toh_enabled and
+                        (minutes_in_hour >= 60 - toh_before_minutes or
+                         minutes_in_hour < toh_after_minutes)):
+                    sleep_secs = toh_interval
+                else:
+                    sleep_secs = interval
+
                 # Sleep in small increments to respond to shutdown signal promptly
-                for _ in range(interval):
+                for _ in range(sleep_secs):
                     if _shutdown:
                         break
                     time.sleep(1)
