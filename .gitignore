@@ -9,6 +9,18 @@ offender_email_draft.txt
 ASL_LinkDetection_Journal.md
 ASL_LinkDetection_Plan.md
 node_*_changes*.md
+node_*_already_in_this_mode.md
+HamVoIP_Pi4_Research.md
+Toggle_Control_Research.md
+
+# Node audit data
+node_*_audit/
+
+# Proposed changes docs
+proposed_*_changes/
+
+# Audit reports
+*_Audit_Report*.md
 
 # Runtime data
 notifications.db
@@ -16,6 +28,7 @@ notifications.db-journal
 
 # Log files
 *.log
+*.log.*
 
 # Bubble map images (fetched at runtime)
 *.jpg

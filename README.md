@@ -151,10 +151,44 @@ python3 asl_link_detector.py
 For persistent monitoring, set up as a system service:
 
 **macOS (launchd)**:
-Create a launch agent plist in `~/Library/LaunchAgents/` with `RunAtLoad`, `KeepAlive`, and `WorkingDirectory` pointing to the project directory. Use the full path to your Python interpreter (e.g., from pyenv).
+
+The service plist is at `~/Library/LaunchAgents/com.example.asl-link-detector.plist`.
+
+```bash
+# Start the service
+launchctl load ~/Library/LaunchAgents/com.example.asl-link-detector.plist
+
+# Stop the service
+launchctl unload ~/Library/LaunchAgents/com.example.asl-link-detector.plist
+```
+
+The service starts on login (`RunAtLoad`) and restarts automatically on crash (`KeepAlive`).
 
 **Linux (systemd)**:
 Create a standard systemd user service unit pointing to the script.
+
+## Operational Scripts
+
+Scripts for controlling auto-disconnect from the monitoring machine (Mac Studio). All take effect on the next scan cycle without requiring a service restart.
+
+| Script | Usage | Description |
+|--------|-------|-------------|
+| `autodisconnect-off` | `./autodisconnect-off <NODE_ID>` | Disable auto-disconnect for a node (creates local override file) |
+| `autodisconnect-on` | `./autodisconnect-on <NODE_ID>` | Re-enable auto-disconnect for a node (removes local override file) |
+| `autodisconnect-status` | `./autodisconnect-status` | Show config and override status for all managed nodes |
+| `autodisconnect-reconfig` | `./autodisconnect-reconfig` | Send SIGHUP to reload config.yaml without restarting the service |
+
+### Two-Layer Disable Mechanism
+
+Auto-disconnect for a managed node requires **both**:
+1. `enabled: true` in `config.yaml` (persistent across Mac Studio reboots)
+2. No local override file at `/tmp/autodisconnect_disabled_<NODE_ID>` (cleared on Mac Studio reboot)
+
+Either layer can independently disable auto-disconnect for a node. The `enabled` field is for persistent configuration changes (edit config.yaml, then run `autodisconnect-reconfig`). The local override files are for quick toggling without editing config files.
+
+### Remote Flag File (Node-Side Disable)
+
+Nodes with `flag_file_check` configured in config.yaml have an additional layer: the monitoring system SSHes into the node before each disconnect attempt and checks for a flag file. If present, the disconnect is skipped (fail-closed). This lets the node's trustee disable auto-disconnect via DTMF without access to the monitoring system.
 
 ## Architecture
 
@@ -218,6 +252,7 @@ Each entry in `auto_disconnect.nodes`:
 | `ssh_key` | Path to SSH private key |
 | `ssh_port` | SSH port (default 22) |
 | `enabled` | Set `true` to activate |
+| `flag_file_check` | Remote file path to check before disconnecting. If file exists on the node, disconnect is skipped. Optional. |
 
 The disconnect command issued is: `asterisk -rx "rpt fun <node_id> *1<target_node>"`
 

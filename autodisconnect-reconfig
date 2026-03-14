@@ -1,0 +1,15 @@
+#!/bin/bash
+# autodisconnect-reconfig — Send SIGHUP to the running monitoring service
+# Causes it to re-read config.yaml on the next scan cycle without a full restart.
+# Use after editing the 'enabled' field or other settings in config.yaml.
+
+PID=$(pgrep -f "asl_link_detector.py")
+if [ -z "$PID" ]; then
+    echo "ERROR: asl_link_detector.py is not running."
+    echo "Start it with: launchctl load ~/Library/LaunchAgents/com.example.asl-link-detector.plist"
+    exit 1
+fi
+
+kill -HUP "$PID"
+echo "Sent SIGHUP to asl_link_detector.py (PID $PID)"
+echo "Config will reload on the next scan cycle."
