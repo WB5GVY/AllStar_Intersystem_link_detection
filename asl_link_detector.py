@@ -34,12 +34,20 @@ logger = logging.getLogger("asl_link_detector")
 
 # Graceful shutdown flag
 _shutdown = False
+# Config reload flag (set by SIGHUP handler)
+_reload_config = False
 
 
 def handle_signal(signum, frame):
     global _shutdown
     logger.info(f"Received signal {signum}, shutting down...")
     _shutdown = True
+
+
+def handle_sighup(signum, frame):
+    global _reload_config
+    logger.info("Received SIGHUP, will reload config on next cycle...")
+    _reload_config = True
 
 
 def setup_logging(config: dict):
@@ -200,6 +208,8 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
 
 
 def main():
+    global _reload_config
+
     parser = argparse.ArgumentParser(
         description="AllStar Intersystem Link Detector"
     )
@@ -239,6 +249,7 @@ def main():
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGHUP, handle_sighup)
 
     # Handle --test-email early (only needs config + notifier)
     notifier = Notifier(config)
@@ -287,6 +298,24 @@ def main():
                 logger.info(f"Entering continuous monitoring (every {interval}s). Ctrl+C to stop.")
 
             while not _shutdown:
+                if _reload_config:
+                    _reload_config = False
+                    logger.info("Reloading config.yaml...")
+                    try:
+                        config = load_config(args.config)
+                        disconnector = AutoDisconnector(config, api_client)
+                        analyzer = GraphAnalyzer(
+                            api_client=api_client,
+                            focus_node=config["focus_node"],
+                            bridge_nodes=config.get("bridge_nodes", []),
+                            allowlist=config.get("allowlist", []),
+                            stale_threshold_minutes=config.get("stale_threshold_minutes", 120),
+                        )
+                        focus_node = config["focus_node"]
+                        logger.info("Config reloaded successfully.")
+                    except Exception as e:
+                        logger.error(f"Config reload failed: {e}. Continuing with previous config.")
+
                 run_scan(analyzer, notifier, disconnector, focus_node,
                          enable_image_crosscheck=enable_image)
 

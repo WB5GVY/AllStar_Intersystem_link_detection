@@ -8,8 +8,10 @@ Modular design: each managed node has its own SSH credentials in config.
 Adding a new node for auto-disconnect is just a config change.
 
 Safety measures:
-  - Configurable per-node enable/disable
+  - Configurable per-node enable/disable (config) + local override files
   - Re-verification delay (default 15s) with fresh API + DNS check
+  - Remote flag file check (fail-closed) for operator-controlled disable
+  - Deepest-managed-node path resolution (never disconnects bridge nodes)
   - Only acts on nodes in the bridging path through a managed node
   - All actions logged; notification sent before disconnect
 """
@@ -37,6 +39,7 @@ class ManagedNode:
     ssh_key: str
     ssh_port: int = 22
     enabled: bool = False
+    flag_file_check: str = ""
 
 
 @dataclass
@@ -45,7 +48,8 @@ class DisconnectResult:
     managed_node: int
     target_node: int
     success: bool
-    action: str          # "disconnected", "skipped_reverify", "skipped_disabled", "ssh_failed"
+    action: str          # "disconnected", "skipped_reverify", "skipped_disabled",
+                         # "skipped_flagfile", "skipped_local_override", "ssh_failed"
     message: str
 
 
@@ -57,6 +61,7 @@ class AutoDisconnector:
     def __init__(self, config: dict, api_client: ASLApiClient):
         self.api = api_client
         self.managed_nodes: dict[int, ManagedNode] = {}
+        self.bridge_nodes: set[int] = set(config.get("bridge_nodes", []))
         self.reverify_delay = config.get("auto_disconnect", {}).get(
             "reverify_delay_seconds", self.DEFAULT_REVERIFY_DELAY
         )
@@ -70,34 +75,37 @@ class AutoDisconnector:
                 ssh_key=node_cfg.get("ssh_key", "~/.ssh/id_rsa"),
                 ssh_port=node_cfg.get("ssh_port", 22),
                 enabled=node_cfg.get("enabled", False),
+                flag_file_check=node_cfg.get("flag_file_check", ""),
             )
             self.managed_nodes[node.node_id] = node
+            override_path = Path(f"/tmp/autodisconnect_disabled_{node.node_id}")
+            local_override = override_path.exists()
             state = "ENABLED" if node.enabled else "disabled"
+            if local_override:
+                state += " (LOCAL OVERRIDE — inactive)"
             logger.info(
                 f"Auto-disconnect: node {node.node_id} at {node.ssh_host} — {state}"
             )
 
     def can_disconnect(self, event: BridgingEvent) -> Optional[ManagedNode]:
-        """Check if we can auto-disconnect for this bridging event.
+        """Find the deepest managed node in the path whose next hop is
+        a valid disconnect target (not a bridge or managed node).
 
-        Returns the ManagedNode if the offending node's path goes through
-        a managed node that has auto-disconnect enabled. Otherwise None.
+        This ensures the system SSHes into the node closest to the offending
+        guest and disconnects the guest — not an intermediate bridge node.
         """
-        # Walk the path to find a managed node that's the direct parent
-        # of the offending node (i.e., the node we'd disconnect FROM)
+        best_managed = None
         for i, node_id in enumerate(event.path):
             if node_id in self.managed_nodes:
                 managed = self.managed_nodes[node_id]
                 if not managed.enabled:
-                    return None
-                # The offending node must be directly connected to this managed node
-                # (i.e., managed node is the parent in the path)
+                    continue  # Skip disabled; don't block deeper nodes
                 if i + 1 < len(event.path):
                     next_in_path = event.path[i + 1]
-                    # The offending node is at the end of the path, but the
-                    # node to disconnect is the one directly after the managed node
-                    return managed
-        return None
+                    if next_in_path in self.bridge_nodes or next_in_path in self.managed_nodes:
+                        continue  # Never disconnect a bridge/managed node
+                    best_managed = managed
+        return best_managed
 
     def target_node_for_disconnect(self, event: BridgingEvent,
                                    managed: ManagedNode) -> Optional[int]:
@@ -129,6 +137,16 @@ class AutoDisconnector:
         target = self.target_node_for_disconnect(event, managed)
         if target is None:
             return None
+
+        # === Local override check (no network needed) ===
+        if self._check_local_override(managed.node_id):
+            msg = (f"Auto-disconnect skipped for node {target} — "
+                   f"locally disabled for managed node {managed.node_id}")
+            logger.info(msg)
+            return DisconnectResult(
+                managed_node=managed.node_id, target_node=target,
+                success=True, action="skipped_local_override", message=msg
+            )
 
         logger.info(
             f"Auto-disconnect candidate: node {target} via managed node "
@@ -204,6 +222,16 @@ class AutoDisconnector:
                     f"node connection(s): {external_nodes}"
                 )
 
+        # === Flag file check: is auto-disconnect disabled by operator? ===
+        if self._check_flag_file(managed):
+            msg = (f"Auto-disconnect skipped for node {target} — disabled by "
+                   f"operator on node {managed.node_id} (flag file present)")
+            logger.info(msg)
+            return DisconnectResult(
+                managed_node=managed.node_id, target_node=target,
+                success=True, action="skipped_flagfile", message=msg
+            )
+
         # === Execute disconnect ===
         logger.warning(
             f"AUTO-DISCONNECT: Disconnecting node {target} from "
@@ -270,3 +298,55 @@ class AutoDisconnector:
                 managed_node=managed.node_id, target_node=target,
                 success=False, action="ssh_failed", message=msg
             )
+
+    def _check_local_override(self, node_id: int) -> bool:
+        """Check if a local override file disables auto-disconnect for this node.
+
+        Returns True if disabled (file exists), False if enabled.
+        """
+        override_path = Path(f"/tmp/autodisconnect_disabled_{node_id}")
+        if override_path.exists():
+            logger.info(
+                f"Local override file {override_path} present — "
+                f"auto-disconnect disabled for node {node_id}"
+            )
+            return True
+        return False
+
+    def _check_flag_file(self, managed: ManagedNode) -> bool:
+        """Check if auto-disconnect is disabled on the managed node via flag file.
+
+        Returns True if disabled (flag file exists OR check fails), False if enabled.
+        Fail-closed: SSH errors are treated as disabled to prevent disconnecting
+        when we cannot confirm the operator's intent.
+        """
+        if not managed.flag_file_check:
+            return False  # No flag file configured — not disabled
+
+        ssh_cmd = [
+            "ssh",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=10",
+            "-o", "BatchMode=yes",
+            "-p", str(managed.ssh_port),
+            "-i", str(Path(managed.ssh_key).expanduser()),
+            f"{managed.ssh_user}@{managed.ssh_host}",
+            f'test -f "{managed.flag_file_check}" && echo DISABLED || echo ENABLED',
+        ]
+
+        try:
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30)
+            output = result.stdout.strip()
+            if output == "DISABLED":
+                logger.info(
+                    f"Flag file {managed.flag_file_check} present on node "
+                    f"{managed.node_id} — auto-disconnect disabled by operator"
+                )
+                return True
+            return False
+        except Exception as e:
+            logger.warning(
+                f"Flag file check failed on node {managed.node_id}: {e}. "
+                f"Skipping disconnect (fail-closed). Will retry next scan cycle."
+            )
+            return True  # Fail-closed: if we can't check, do not disconnect

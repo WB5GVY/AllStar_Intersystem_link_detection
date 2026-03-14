@@ -1,0 +1,54 @@
+#!/bin/bash
+# autodisconnect-status — Show auto-disconnect status for all managed nodes
+# Reads config.yaml for enabled field, checks for local override files,
+# and reports effective status for each managed node.
+
+REAL_SCRIPT="$(readlink "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$REAL_SCRIPT")" && pwd)"
+CONFIG="$SCRIPT_DIR/config.yaml"
+
+if [ ! -f "$CONFIG" ]; then
+    echo "ERROR: config.yaml not found at $CONFIG"
+    exit 1
+fi
+
+echo ""
+echo "Auto-Disconnect Status"
+echo "======================"
+echo ""
+
+# Use pyenv python if available (has PyYAML), otherwise fall back to python3 on PATH
+PYTHON="${HOME}/.pyenv/versions/3.13.5/bin/python3"
+[ -x "$PYTHON" ] || PYTHON="python3"
+
+"$PYTHON" -c "
+import yaml, os
+with open('$CONFIG') as f:
+    config = yaml.safe_load(f)
+nodes = config.get('auto_disconnect', {}).get('nodes', [])
+if not nodes:
+    print('  No managed nodes configured.')
+else:
+    for node in nodes:
+        nid = node['node_id']
+        enabled = node.get('enabled', False)
+        flag_file = node.get('flag_file_check', '')
+        override_path = f'/tmp/autodisconnect_disabled_{nid}'
+        has_override = os.path.exists(override_path)
+        config_str = 'ENABLED' if enabled else 'DISABLED'
+        override_str = 'OVERRIDE' if has_override else 'no override'
+        effective = 'ACTIVE' if (enabled and not has_override) else 'INACTIVE'
+        flag_str = f', flag_file={flag_file}' if flag_file else ''
+        print(f'  Node {nid}: config={config_str}, local={override_str} => {effective}{flag_str}')
+print()
+
+# Also show if service is running
+import subprocess
+result = subprocess.run(['pgrep', '-f', 'asl_link_detector.py'], capture_output=True, text=True)
+if result.stdout.strip():
+    pids = result.stdout.strip().split()
+    print(f'  Service: RUNNING (PID {pids[0]})')
+else:
+    print('  Service: NOT RUNNING')
+print()
+"

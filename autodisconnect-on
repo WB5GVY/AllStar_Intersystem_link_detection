@@ -1,0 +1,17 @@
+#!/bin/bash
+# autodisconnect-on — Remove local override to re-enable auto-disconnect for a node
+# Usage: autodisconnect-on <NODE_ID>
+# Removes /tmp/autodisconnect_disabled_<NODE_ID>
+# Takes effect on the next scan cycle (no service restart needed).
+
+if [ -z "$1" ]; then
+    echo "Usage: autodisconnect-on <NODE_ID>"
+    echo "Re-enables auto-disconnect for the specified managed node."
+    exit 1
+fi
+
+NODE="$1"
+FLAG="/tmp/autodisconnect_disabled_${NODE}"
+rm -f "$FLAG"
+echo "Auto-disconnect ENABLED for node $NODE (removed $FLAG)"
+echo "This takes effect on the next scan cycle."
