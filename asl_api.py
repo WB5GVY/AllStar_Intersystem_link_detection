@@ -11,7 +11,10 @@ logger = logging.getLogger(__name__)
 
 API_BASE = "https://stats.allstarlink.org/api/stats"
 
-# Rate limit: 30 requests/minute aggregate across all per-node queries.
+# Rate limit: 30 requests/minute/IP aggregate across all per-node queries.
+# Documented in ASL3-Manual (AllStarLink GitHub): docs/developers/api.md
+# Confirmed via X-RateLimit-Limit: 30 response header from stats.allstarlink.org.
+# Exceeding the limit returns HTTP 429 with Retry-After header (~40s observed).
 # We enforce a minimum delay between requests to stay well under the limit.
 MIN_REQUEST_INTERVAL = 2.5  # seconds between requests (~24/min max)
 
