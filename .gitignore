@@ -22,10 +22,10 @@ proposed_*_changes/
 # Audit reports
 *_Audit_Report*.md
 
-# Setup/migration docs (contain real IPs, SSH ports, node numbers — pending sanitization)
+# Setup/migration docs (local only)
 SETUP.md
 
-# launchd plist (contains real paths and usernames)
+# launchd plist (local only)
 *.plist
 
 # Runtime data

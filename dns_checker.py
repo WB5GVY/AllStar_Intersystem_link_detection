@@ -67,7 +67,7 @@ def _check_with_dnspython(node_id: int, hostname: str, timeout: float) -> NodeDN
         resolver.lifetime = timeout
         answers = resolver.resolve(hostname, "TXT")
 
-        # Parse TXT record fields: "NN=68822" "IP=172.56.91.138" "PT=4569"
+        # Parse TXT record fields: "NN=12345" "IP=198.51.100.1" "PT=4569"
         fields = {}
         for rdata in answers:
             for s in rdata.strings:
@@ -112,7 +112,7 @@ def _check_with_dig(node_id: int, hostname: str, timeout: float) -> NodeDNSInfo:
             logger.debug(f"DNS (dig): {hostname} -> no record")
             return NodeDNSInfo(node_id=node_id, is_registered=False)
 
-        # Parse: "NN=68822" "IP=172.56.91.138" "PT=4569"
+        # Parse: "NN=12345" "IP=198.51.100.1" "PT=4569"
         fields = {}
         for part in output.replace('"', '').split():
             if "=" in part:
