@@ -22,6 +22,12 @@ proposed_*_changes/
 # Audit reports
 *_Audit_Report*.md
 
+# Setup/migration docs (contain real IPs, SSH ports, node numbers — pending sanitization)
+SETUP.md
+
+# launchd plist (contains real paths and usernames)
+*.plist
+
 # Runtime data
 notifications.db
 notifications.db-journal

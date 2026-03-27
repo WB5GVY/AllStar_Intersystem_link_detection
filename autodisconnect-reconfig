@@ -6,7 +6,7 @@
 PID=$(pgrep -f "asl_link_detector.py")
 if [ -z "$PID" ]; then
     echo "ERROR: asl_link_detector.py is not running."
-    echo "Start it with: launchctl load ~/Library/LaunchAgents/com.example.asl-link-detector.plist"
+    echo "Start it with: launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.example.asl-link-detector.plist"
     exit 1
 fi
 
