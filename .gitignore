@@ -22,6 +22,12 @@ proposed_*_changes/
 # Audit reports
 *_Audit_Report*.md
 
+# Setup/migration docs (local only)
+SETUP.md
+
+# launchd plist (local only)
+*.plist
+
 # Runtime data
 notifications.db
 notifications.db-journal
