@@ -3,7 +3,7 @@
 import logging
 import smtplib
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -112,6 +112,11 @@ class Notifier:
         self.rate_limits = config.get("rate_limits", {})
         self.quiet_config = config.get("quiet_hours", {})
         self.email_config = config.get("notifications", {}).get("email", {})
+
+        # Health tracking (read by StatusCollector — no functional side effects)
+        self._email_healthy: bool = True
+        self._last_email_send: Optional[str] = None
+        self._qrz_healthy: bool = True
 
         # QRZ lookup for offender notification
         qrz_config = config.get("qrz", {})
@@ -268,10 +273,13 @@ class Notifier:
             )
             server.quit()
 
+            self._email_healthy = True
+            self._last_email_send = datetime.now(timezone.utc).isoformat()
             logger.info(f"Email sent for node {event.offending_node} to {cfg['recipients']}")
             return True
 
         except Exception as e:
+            self._email_healthy = False
             logger.error(f"Failed to send email: {e}")
             return False
 
@@ -349,10 +357,13 @@ This is an automated alert from the ASL Intersystem Link Detector.
             )
             server.quit()
 
+            self._email_healthy = True
+            self._last_email_send = datetime.now(timezone.utc).isoformat()
             logger.info(f"Hidden-path alert email sent to {cfg['recipients']}")
             return True
 
         except Exception as e:
+            self._email_healthy = False
             logger.error(f"Failed to send hidden-path alert email: {e}")
             return False
 
@@ -418,6 +429,7 @@ This is an automated alert from the ASL Intersystem Link Detector.
             return
 
         qrz_info = self.qrz.lookup(callsign)
+        self._qrz_healthy = qrz_info is not None
         if qrz_info is None:
             logger.warning(f"QRZ lookup failed for {callsign}")
             return

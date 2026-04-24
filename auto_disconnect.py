@@ -299,6 +299,62 @@ class AutoDisconnector:
                 success=False, action="ssh_failed", message=msg
             )
 
+    def check_ssh_health(self) -> dict[int, bool]:
+        """Test SSH connectivity to all managed nodes.
+
+        Runs a lightweight 'echo ok' on each node with a short timeout.
+        Returns {node_id: True if reachable, False if not}.
+        No side effects — does not disconnect or modify anything.
+        """
+        results = {}
+        for node_id, managed in self.managed_nodes.items():
+            ssh_cmd = [
+                "ssh",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ConnectTimeout=5",
+                "-o", "BatchMode=yes",
+                "-p", str(managed.ssh_port),
+                "-i", str(Path(managed.ssh_key).expanduser()),
+                f"{managed.ssh_user}@{managed.ssh_host}",
+                "echo ok",
+            ]
+            try:
+                result = subprocess.run(
+                    ssh_cmd, capture_output=True, text=True, timeout=10
+                )
+                healthy = result.returncode == 0
+                if not healthy:
+                    logger.warning(
+                        f"SSH health check failed for node {node_id} "
+                        f"({managed.ssh_host}): rc={result.returncode}"
+                    )
+                results[node_id] = healthy
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    f"SSH health check timed out for node {node_id} "
+                    f"({managed.ssh_host})"
+                )
+                results[node_id] = False
+            except Exception as e:
+                logger.warning(
+                    f"SSH health check error for node {node_id} "
+                    f"({managed.ssh_host}): {e}"
+                )
+                results[node_id] = False
+        return results
+
+    def check_flag_files(self) -> dict[int, bool]:
+        """Check flag file status on nodes with flag_file_check configured.
+
+        Returns {node_id: True if disabled (flag exists), False if enabled}.
+        Uses the same fail-closed logic as _check_flag_file().
+        """
+        results = {}
+        for node_id, managed in self.managed_nodes.items():
+            if managed.flag_file_check:
+                results[node_id] = self._check_flag_file(managed)
+        return results
+
     def _check_local_override(self, node_id: int) -> bool:
         """Check if a local override file disables auto-disconnect for this node.
 

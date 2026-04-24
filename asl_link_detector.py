@@ -29,6 +29,7 @@ from bubble_analyzer import fetch_and_analyze
 from cross_checker import cross_check
 from graph_analyzer import GraphAnalyzer
 from notifier import Notifier
+from status_server import StatusCollector, start_status_server
 
 logger = logging.getLogger("asl_link_detector")
 
@@ -126,7 +127,9 @@ def load_config(config_path: str) -> dict:
 
 def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
              disconnector: AutoDisconnector,
-             focus_node: int, dry_run: bool = False,
+             focus_node: int, api_client=None,
+             collector: StatusCollector = None,
+             dry_run: bool = False,
              enable_image_crosscheck: bool = True) -> bool:
     """Run a single topology scan with optional image cross-check.
 
@@ -137,6 +140,11 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
 
     # === Phase 1: API-based analysis ===
     result = analyzer.scan()
+
+    if collector:
+        collector.update_scan(result)
+        if api_client:
+            collector.update_api_health(api_client)
 
     total_nodes = len(result.topology)
     logger.info(f"API scan complete: {total_nodes} nodes in topology")
@@ -194,6 +202,11 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
                 warnings=crosscheck_result.warnings,
             )
 
+    if collector:
+        collector.update_email_health(notifier)
+        collector.update_qrz_health(notifier)
+        collector.update_notification_state(notifier)
+
     # === Phase 3: Auto-disconnect (after notification, not in dry-run) ===
     if result.has_problems and not dry_run:
         for event in result.bridging_events:
@@ -203,6 +216,8 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
                     f"Auto-disconnect result for node {disc_result.target_node}: "
                     f"{disc_result.action} — {disc_result.message}"
                 )
+                if collector:
+                    collector.update_disconnect(disc_result)
 
     return True
 
@@ -268,6 +283,18 @@ def main():
     )
     disconnector = AutoDisconnector(config, api_client)
 
+    # Status server for Home Assistant integration
+    collector = StatusCollector()
+    collector.record_startup()
+    collector.update_managed_nodes(disconnector)
+    status_cfg = config.get("status_server", {})
+    health_check_interval = status_cfg.get("health_check_interval_seconds", 300)
+    if status_cfg.get("enabled", True):
+        start_status_server(
+            collector,
+            port=status_cfg.get("port", 61211),
+        )
+
     enable_image = not args.no_image
     if enable_image:
         logger.info("Bubble map image cross-check: ENABLED")
@@ -277,7 +304,16 @@ def main():
     try:
         if args.once or args.dry_run:
             run_scan(analyzer, notifier, disconnector, focus_node,
+                     api_client=api_client, collector=collector,
                      dry_run=args.dry_run, enable_image_crosscheck=enable_image)
+            # Run health checks once for single-scan modes
+            try:
+                ssh_results = disconnector.check_ssh_health()
+                collector.update_ssh_health(ssh_results)
+                flag_results = disconnector.check_flag_files()
+                collector.update_flag_files(flag_results)
+            except Exception as e:
+                logger.error(f"Health check error: {e}")
         else:
             # Continuous monitoring loop
             interval = config.get("poll_interval_seconds", 300)
@@ -297,6 +333,8 @@ def main():
             else:
                 logger.info(f"Entering continuous monitoring (every {interval}s). Ctrl+C to stop.")
 
+            last_health_check = 0  # Force immediate check on first cycle
+
             while not _shutdown:
                 if _reload_config:
                     _reload_config = False
@@ -312,12 +350,36 @@ def main():
                             stale_threshold_minutes=config.get("stale_threshold_minutes", 120),
                         )
                         focus_node = config["focus_node"]
+                        health_check_interval = config.get("status_server", {}).get(
+                            "health_check_interval_seconds", 300
+                        )
+                        collector.update_config_reload(success=True)
+                        collector.update_managed_nodes(disconnector)
                         logger.info("Config reloaded successfully.")
                     except Exception as e:
+                        collector.update_config_reload(success=False)
                         logger.error(f"Config reload failed: {e}. Continuing with previous config.")
 
                 run_scan(analyzer, notifier, disconnector, focus_node,
+                         api_client=api_client, collector=collector,
                          enable_image_crosscheck=enable_image)
+
+                # Periodic SSH health and flag file checks
+                now_ts = time.time()
+                if now_ts - last_health_check >= health_check_interval:
+                    last_health_check = now_ts
+                    try:
+                        logger.debug("Running SSH health checks...")
+                        ssh_results = disconnector.check_ssh_health()
+                        collector.update_ssh_health(ssh_results)
+                        flag_results = disconnector.check_flag_files()
+                        collector.update_flag_files(flag_results)
+                        logger.info(
+                            f"Health checks complete: SSH {ssh_results}, "
+                            f"flag files {flag_results}"
+                        )
+                    except Exception as e:
+                        logger.error(f"Health check error: {e}")
 
                 # Determine sleep interval based on proximity to top of hour
                 now = datetime.now()

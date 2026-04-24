@@ -25,6 +25,15 @@ proposed_*_changes/
 # Setup/migration docs (local only)
 SETUP.md
 
+# WebSocket reference doc (local only)
+Listener_WebSocket_Reference.md
+
+# Cloud node integration doc (local only)
+Cloud_Node_Requirements_for_Monitoring.md
+
+# HA integration proposal (local only)
+proposed_HA_integration.md
+
 # launchd plist (local only)
 *.plist
 

@@ -30,6 +30,10 @@ class ASLApiClient:
             "User-Agent": "ASL-LinkDetector/1.0",
             "Accept": "application/json",
         })
+        # Health tracking (read by StatusCollector — no functional side effects)
+        self._api_healthy: bool = True
+        self.last_rate_limit_remaining: Optional[int] = None
+        self.last_429_timestamp: Optional[str] = None
 
     def _rate_limit_wait(self):
         """Enforce minimum interval between API requests."""
@@ -47,6 +51,13 @@ class ASLApiClient:
         try:
             resp = self.session.get(url, timeout=self.timeout)
             resp.raise_for_status()
+            self._api_healthy = True
+            rl = resp.headers.get("X-RateLimit-Remaining")
+            if rl is not None:
+                try:
+                    self.last_rate_limit_remaining = int(rl)
+                except ValueError:
+                    pass
             data = resp.json()
             stats = data.get("stats")
             if stats and isinstance(stats, dict) and stats.get("data"):
@@ -57,15 +68,19 @@ class ASLApiClient:
             return data
         except requests.exceptions.HTTPError as e:
             if resp.status_code == 429:
+                self.last_429_timestamp = datetime.now(timezone.utc).isoformat()
                 logger.warning(f"Rate limited by API (429). Backing off 60s.")
                 time.sleep(60)
                 return self.get_node_stats(node_id)  # Retry once
+            self._api_healthy = False
             logger.error(f"HTTP error fetching node {node_id}: {e}")
             return None
         except requests.exceptions.RequestException as e:
+            self._api_healthy = False
             logger.error(f"Request error fetching node {node_id}: {e}")
             return None
         except ValueError as e:
+            self._api_healthy = False
             logger.error(f"JSON decode error for node {node_id}: {e}")
             return None
 

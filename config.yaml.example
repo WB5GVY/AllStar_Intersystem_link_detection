@@ -101,3 +101,11 @@ voice_announcement:
   ssh_user: "repeater"
   ssh_key: "~/.ssh/id_rsa"
   announce_node: YYYYY
+
+# HTTP status server for Home Assistant dashboard integration.
+# Serves GET /status (full JSON) and GET /health (liveness check).
+# Binds to 0.0.0.0 for LAN access. Do not expose to the internet.
+status_server:
+  enabled: true
+  port: 61211
+  health_check_interval_seconds: 300  # SSH health + flag file checks (seconds)
