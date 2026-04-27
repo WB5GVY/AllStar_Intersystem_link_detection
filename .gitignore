@@ -50,6 +50,11 @@ notifications.db-journal
 *.jpeg
 *.png
 
+# Backup files (timestamped or descriptive .bak suffixes)
+*.bak
+*.bak.*
+.git.bak.*/
+
 # Python
 __pycache__/
 *.pyc
