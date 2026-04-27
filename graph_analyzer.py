@@ -227,13 +227,15 @@ class GraphAnalyzer:
                         continue
 
                     path = [self.focus_node, hop1_node, hop2_node]
+                    # Offender is the boundary node (hop1) — it owns the connection
+                    # to focus AND the connection beyond. hop2 is just on the receiving end.
                     event = BridgingEvent(
-                        offending_node=hop2_node,
-                        offending_callsign=hop2_callsign,
-                        offending_location=hop2_location,
+                        offending_node=hop1_node,
+                        offending_callsign=hop1_info["callsign"],
+                        offending_location=hop1_info.get("location", "Unknown"),
                         path=path,
                         path_description=f"{self.focus_node} → {hop1_node} → {hop2_node}",
-                        depth=2,
+                        depth=1,
                         rule=f"Screen 2: non-bridge node {hop1_node} has connection to {hop2_node}",
                     )
                     result.bridging_events.append(event)
@@ -327,13 +329,17 @@ class GraphAnalyzer:
                 "callsign": hop3_callsign, "location": hop3_location,
             }
 
+            # Offender is the boundary node (the guest) — it owns the connection
+            # to the bridge AND the unauthorized connection beyond. hop3 is on
+            # the receiving end.
+            guest_info = result.topology.get(guest_node, {})
             event = BridgingEvent(
-                offending_node=hop3_node,
-                offending_callsign=hop3_callsign,
-                offending_location=hop3_location,
+                offending_node=guest_node,
+                offending_callsign=guest_info.get("callsign", "Unknown"),
+                offending_location=guest_info.get("location", "Unknown"),
                 path=path,
                 path_description=" → ".join(str(n) for n in path),
-                depth=3,
+                depth=2,
                 rule=(f"Screen 2: guest {guest_node} (via bridge {bridge_node}) "
                       f"has unauthorized connection to {hop3_node}"),
             )
