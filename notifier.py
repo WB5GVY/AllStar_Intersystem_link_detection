@@ -298,7 +298,7 @@ class Notifier:
 
         # Use general rate limits (not per-node, since we don't know the node)
         max_hourly = self.rate_limits.get("max_per_hour", 3)
-        if self.tracker.count_recent(hours=1.0) >= max_hourly:
+        if self.tracker.count_recent(minutes=60.0) >= max_hourly:
             logger.info("Hidden-path alert suppressed: hourly rate limit")
             return False
 

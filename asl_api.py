@@ -168,16 +168,31 @@ class ASLApiClient:
             linked = stats_data.get("linkedNodes", [])
             results = []
             for n in linked:
-                # The "name" field is normally a numeric node ID, but some
-                # connections (e.g., RepeaterPhone/EchoLink) use callsigns.
+                # The "name" field is normally a numeric AllStar node ID, but:
+                #   - non-numeric values (callsigns) = RepeaterPhone/inbound EchoLink
+                #   - 7-digit numerics with leading 3 = outbound EchoLink (AllStar
+                #     reserves 3xxxxxx for the EchoLink number space)
+                # Both forms are external connections; the AllStar stats API does
+                # not serve them, so they must be flagged here to skip recursion.
                 name_raw = str(n.get("name", "0"))
-                if not name_raw.isdigit():
-                    # Non-numeric = external connection (RepeaterPhone, EchoLink, etc.)
+                is_echolink_numeric = (
+                    name_raw.isdigit()
+                    and len(name_raw) == 7
+                    and name_raw.startswith("3")
+                )
+                if not name_raw.isdigit() or is_echolink_numeric:
+                    if is_echolink_numeric:
+                        # Strip the "3" prefix and any leading zeros for display
+                        ext_name = f"EchoLink-{name_raw[1:].lstrip('0') or '0'}"
+                        kind = "EchoLink"
+                    else:
+                        ext_name = name_raw
+                        kind = "RepeaterPhone/EchoLink/etc."
                     results.append({
                         "node_id": 0,
-                        "external_name": name_raw,
+                        "external_name": ext_name,
                         "is_external": True,
-                        "callsign": name_raw,
+                        "callsign": ext_name,
                         "location": "External Connection",
                         "frequency": "",
                         "affiliation": "",
@@ -187,7 +202,7 @@ class ASLApiClient:
                     })
                     logger.info(
                         f"  Node {node_id} has external connection: "
-                        f"'{name_raw}' (RepeaterPhone/EchoLink/etc.)"
+                        f"'{ext_name}' ({kind})"
                     )
                     continue
                 server = n.get("server", {}) or {}
