@@ -11,13 +11,20 @@ request triggers SSH, API calls, or any other side effect.
 import copy
 import json
 import logging
+import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# A repeated detection of the same path within this many minutes is treated
+# as the same incident for the "violations today" counter — matches the
+# notification per-path cooldown semantics so the count means "distinct
+# incidents", not "scan observations".
+VIOLATION_DEDUP_WINDOW_MIN = 15.0
 
 
 class StatusCollector:
@@ -28,15 +35,18 @@ class StatusCollector:
     A single Lock serializes access.
     """
 
-    def __init__(self):
+    def __init__(self, db_path: str = "notifications.db"):
         self._lock = threading.Lock()
+        self.db_path = db_path
+        self._bridge_nodes: set[int] = set()
         self._state = {
-            "version": "1.0",
+            "version": "1.1",
             "timestamp": None,
             "scan_ok": False,
             "violations": {"count": 0, "details": []},
             "topology": {"total_nodes": 0, "focus_node_links": 0},
             "managed_nodes": {},
+            "last_violation": None,
             "last_disconnect": None,
             "api": {"healthy": True, "rate_limit_remaining": None, "last_429": None},
             "email": {"healthy": True, "last_send": None},
@@ -48,9 +58,93 @@ class StatusCollector:
             },
             "config": {"last_reload": None},
         }
+        self._init_persistence()
+        self._load_persisted_state()
+
+    def _init_persistence(self):
+        """Create the status-state and event-log tables if they don't exist.
+
+        Co-located in notifications.db so monitor state lives alongside
+        notification rate-limit tracking — one DB, owned by this process.
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS status_state (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS violations_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        path_description TEXT NOT NULL,
+                        offending_node INTEGER NOT NULL,
+                        offending_callsign TEXT
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_viol_ts ON violations_log(timestamp)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_viol_path ON violations_log(path_description)")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS disconnects_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        managed_node TEXT NOT NULL,
+                        target_node INTEGER NOT NULL,
+                        success INTEGER NOT NULL,
+                        action TEXT
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_disc_ts ON disconnects_log(timestamp)")
+        except sqlite3.Error as e:
+            logger.warning(f"Status persistence init failed ({self.db_path}): {e}. "
+                           f"Counters and last_* fields will not survive restarts.")
+
+    def _load_persisted_state(self):
+        """Load last_violation / last_disconnect from status_state into memory."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT key, value FROM status_state WHERE key IN ('last_violation','last_disconnect')"
+                ).fetchall()
+        except sqlite3.Error as e:
+            logger.warning(f"Could not load persisted status state: {e}")
+            return
+        for key, value in rows:
+            try:
+                self._state[key] = json.loads(value)
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    def _persist_state(self, key: str, value):
+        """Write a single state field to status_state. Best-effort; logs on error."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO status_state (key, value, updated_at) VALUES (?, ?, ?)",
+                    (key, json.dumps(value), datetime.now(timezone.utc).isoformat())
+                )
+        except sqlite3.Error as e:
+            logger.warning(f"Failed to persist {key}: {e}")
+
+    def attach_disconnector(self, disconnector):
+        """Capture the bridge_nodes set so manageability can be computed in
+        get_snapshot() without holding a reference to the disconnector itself.
+        Call once at startup, after the disconnector is constructed.
+        """
+        try:
+            self._bridge_nodes = set(disconnector.bridge_nodes)
+        except AttributeError:
+            self._bridge_nodes = set()
 
     def update_scan(self, result):
         """Update state from a completed scan.
+
+        Persists each detected violation to violations_log (deduped by
+        path within VIOLATION_DEDUP_WINDOW_MIN), and updates last_violation
+        in both memory and status_state.
 
         Args:
             result: ScanResult from GraphAnalyzer.scan()
@@ -61,15 +155,51 @@ class StatusCollector:
                 "offending_node": ev.offending_node,
                 "offending_callsign": ev.offending_callsign,
                 "path_description": ev.path_description,
+                "path": list(ev.path),
                 "rule": ev.rule,
             })
 
         # Count focus node direct links from topology
-        focus_node = result.focus_node
         focus_links = 0
         for node_id, info in result.topology.items():
             if info.get("depth") == 1:
                 focus_links += 1
+
+        # Persist new violation rows (deduped) and pick the most recent for
+        # last_violation. Done outside the lock — SQLite handles its own
+        # concurrency, and we don't want disk I/O blocking get_snapshot.
+        new_last_violation = None
+        if result.bridging_events:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            cutoff = (datetime.utcnow() - timedelta(minutes=VIOLATION_DEDUP_WINDOW_MIN)).isoformat()
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    for ev in result.bridging_events:
+                        # Dedup: same path within the window counts as one incident
+                        recent = conn.execute(
+                            "SELECT 1 FROM violations_log "
+                            "WHERE path_description = ? AND timestamp > ? LIMIT 1",
+                            (ev.path_description, cutoff)
+                        ).fetchone()
+                        if recent:
+                            continue
+                        conn.execute(
+                            "INSERT INTO violations_log (timestamp, path_description, offending_node, offending_callsign) "
+                            "VALUES (?, ?, ?, ?)",
+                            (now_iso, ev.path_description, ev.offending_node, ev.offending_callsign)
+                        )
+            except sqlite3.Error as e:
+                logger.warning(f"Failed to record violations to log: {e}")
+            # Use the most recent (last) event as last_violation, regardless of dedup
+            ev = result.bridging_events[-1]
+            new_last_violation = {
+                "timestamp": now_iso,
+                "offending_node": ev.offending_node,
+                "offending_callsign": ev.offending_callsign,
+                "path_description": ev.path_description,
+                "path": list(ev.path),
+            }
+            self._persist_state("last_violation", new_last_violation)
 
         with self._lock:
             self._state["timestamp"] = result.timestamp
@@ -82,6 +212,8 @@ class StatusCollector:
                 "total_nodes": len(result.topology),
                 "focus_node_links": focus_links,
             }
+            if new_last_violation is not None:
+                self._state["last_violation"] = new_last_violation
 
     def update_disconnect(self, disc_result):
         """Update state from a disconnect attempt.
@@ -119,7 +251,26 @@ class StatusCollector:
                     "target": disc_result.target_node,
                     "timestamp": disconnect_info["timestamp"],
                     "success": disc_result.success,
+                    "action": disc_result.action,
                 }
+
+        # Persist outside the lock — every attempt goes to the log so
+        # disconnects_today reflects all auto-disconnect activity (including
+        # skips). last_disconnect is persisted only for actual SSH attempts.
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO disconnects_log (timestamp, managed_node, target_node, success, action) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (disconnect_info["timestamp"], node_key,
+                     disc_result.target_node,
+                     1 if disc_result.success else 0,
+                     disc_result.action)
+                )
+        except sqlite3.Error as e:
+            logger.warning(f"Failed to record disconnect to log: {e}")
+        if disc_result.action in ("disconnected", "ssh_failed"):
+            self._persist_state("last_disconnect", self._state["last_disconnect"])
 
     def update_managed_nodes(self, disconnector):
         """Refresh enabled/local_override state for all managed nodes.
@@ -274,13 +425,120 @@ class StatusCollector:
                 datetime.now(timezone.utc).isoformat()
             )
 
-    def get_snapshot(self) -> dict:
-        """Return a thread-safe deep copy of the current state.
+    def _today_start_iso(self) -> str:
+        """UTC midnight today, ISO formatted, as a string comparator for SQLite."""
+        now = datetime.now(timezone.utc)
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return midnight.isoformat()
 
-        Called by the HTTP handler. Acquires lock briefly for the copy.
+    def _compute_counters(self) -> dict:
+        """Count today's violations and disconnects from the event logs."""
+        cutoff = self._today_start_iso()
+        violations_today = 0
+        disconnects_today = 0
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM violations_log WHERE timestamp > ?",
+                    (cutoff,)
+                ).fetchone()
+                violations_today = row[0] if row else 0
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM disconnects_log WHERE timestamp > ?",
+                    (cutoff,)
+                ).fetchone()
+                disconnects_today = row[0] if row else 0
+        except sqlite3.Error as e:
+            logger.warning(f"Counter query failed: {e}")
+        return {
+            "violations_today": violations_today,
+            "disconnects_today": disconnects_today,
+        }
+
+    def _is_managed_operational(self, node_state: dict) -> bool:
+        """A managed node is operational iff it can perform a disconnect right now."""
+        if not node_state.get("enabled", False):
+            return False
+        if node_state.get("local_override"):
+            return False
+        if node_state.get("flag_file_disabled"):
+            return False
+        if node_state.get("ssh_healthy") is False:
+            return False
+        return True
+
+    def _compute_health(self, state: dict) -> dict:
+        """Build the health block: which managed nodes are degraded, whether
+        any are operational, and how many current violations have no
+        operational managed node in their disconnect path.
+        """
+        managed = state.get("managed_nodes", {})
+        degraded = []
+        for node_key, node_state in managed.items():
+            reasons = []
+            if not node_state.get("enabled", False):
+                reasons.append("config_disabled")
+            if node_state.get("local_override"):
+                reasons.append("local_override")
+            if node_state.get("flag_file_disabled"):
+                reasons.append("flag_file_disabled")
+            if node_state.get("ssh_healthy") is False:
+                reasons.append("ssh_unhealthy")
+            if reasons:
+                degraded.append({"node": node_key, "reasons": reasons})
+
+        disconnect_capable = any(
+            self._is_managed_operational(s) for s in managed.values()
+        )
+
+        # For each current violation, see whether some node in its path is an
+        # operational managed node whose next-in-path is a disconnect target
+        # (not a bridge or another managed node). Mirrors the can_disconnect
+        # logic in auto_disconnect.py.
+        unmanageable = 0
+        bridge_nodes = self._bridge_nodes
+        for v in state.get("violations", {}).get("details", []):
+            path = v.get("path") or []
+            manageable = False
+            for i, node_id in enumerate(path):
+                node_key = str(node_id)
+                if node_key not in managed:
+                    continue
+                if not self._is_managed_operational(managed[node_key]):
+                    continue
+                if i + 1 >= len(path):
+                    continue  # nothing to disconnect after this
+                next_in_path = path[i + 1]
+                if next_in_path in bridge_nodes:
+                    continue  # don't disconnect a bridge
+                if str(next_in_path) in managed:
+                    continue  # don't disconnect a managed node
+                manageable = True
+                break
+            if not manageable:
+                unmanageable += 1
+
+        return {
+            "disconnect_capable": disconnect_capable,
+            "unmanageable_violations": unmanageable,
+            "degraded_managed_nodes": degraded,
+        }
+
+    def get_snapshot(self) -> dict:
+        """Return a thread-safe deep copy of the current state, plus
+        derived counters and health fields computed at request time.
+
+        Counters are queried from SQLite per request — cheap (indexed
+        COUNT queries on small tables), bounded (rows are pruned implicitly
+        by the today-window).
         """
         with self._lock:
-            return copy.deepcopy(self._state)
+            snapshot = copy.deepcopy(self._state)
+        # Derived fields (no lock held — they read from SQLite and from
+        # the just-copied snapshot).
+        snapshot["counters"] = self._compute_counters()
+        snapshot["health"] = self._compute_health(snapshot)
+        return snapshot
 
 
 class StatusHandler(BaseHTTPRequestHandler):

@@ -284,7 +284,8 @@ def main():
     disconnector = AutoDisconnector(config, api_client)
 
     # Status server for Home Assistant integration
-    collector = StatusCollector()
+    collector = StatusCollector(db_path=str(Path(config.get("db_path", "notifications.db"))))
+    collector.attach_disconnector(disconnector)
     collector.record_startup()
     collector.update_managed_nodes(disconnector)
     status_cfg = config.get("status_server", {})
