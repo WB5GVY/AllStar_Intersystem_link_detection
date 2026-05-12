@@ -123,15 +123,61 @@ def cross_check(api_result: ScanResult,
         result.image_shows_deeper_topology = True
         if result.image_max_distance >= 3 and result.api_max_depth < 3:
             # Image sees nodes at distance ≥ 3 but API didn't detect bridging.
-            # This is the key hidden-path detection scenario.
-            result.possible_hidden_path_bridging = True
-            result.warnings.append(
-                f"IMAGE SHOWS DEEPER TOPOLOGY than API! "
-                f"Image max distance={result.image_max_distance}, "
-                f"API max depth={result.api_max_depth}. "
-                f"This may indicate bridging through a non-reporting node "
-                f"that the API cannot see (hidden path)."
+            # This is the historically-named hidden-path detection scenario.
+            #
+            # SUPPRESSION GATES (in order):
+            #
+            # (a) Focus triangle: when the API topology contains a triangle
+            #     through the focus (focus↔A, focus↔B, A↔B), the bubble-map's
+            #     straight-line edge tracer occasionally drops one of the
+            #     routed-around edges, producing a phantom +1 distance for
+            #     nodes hanging off the affected corner. We trust the API.
+            #
+            # (b) Insufficient deep extras: a real hidden path through a non-
+            #     reporting hop-1 typically pulls in multiple deep nodes (the
+            #     non-reporting node's children, and often their links). A
+            #     contour artifact in the image — phantom 12th ellipse from
+            #     text or anti-aliasing — produces exactly one extra deep node.
+            #     Require at least 2 image nodes at distance ≥ 2 beyond what
+            #     the API has at depth ≥ 2. This is the more useful gate in
+            #     practice; (a) is kept as a belt-and-suspenders.
+            api_deep = sum(
+                1 for info in api_result.topology.values()
+                if info.get("depth", 0) >= 2
             )
+            image_deep = sum(
+                1 for d in image_result.distances.values()
+                if d >= 2
+            )
+            deep_extra = image_deep - api_deep
+            if api_result.has_focus_triangle:
+                result.findings.append(
+                    f"Image max distance ({result.image_max_distance}) exceeds "
+                    f"API max depth ({result.api_max_depth}), but API topology "
+                    f"contains a focus triangle — known to produce phantom "
+                    f"distance jumps via image-processor edge dropouts. "
+                    f"Hidden-path alert suppressed."
+                )
+            elif deep_extra < 2:
+                result.findings.append(
+                    f"Image max distance ({result.image_max_distance}) exceeds "
+                    f"API max depth ({result.api_max_depth}), but image only "
+                    f"shows {deep_extra} extra node(s) at distance ≥ 2 vs API "
+                    f"({image_deep} image, {api_deep} API). A real hidden path "
+                    f"would typically pull in ≥ 2 deep nodes; one extra is "
+                    f"more consistent with a contour artifact. Hidden-path "
+                    f"alert suppressed."
+                )
+            else:
+                result.possible_hidden_path_bridging = True
+                result.warnings.append(
+                    f"IMAGE SHOWS DEEPER TOPOLOGY than API! "
+                    f"Image max distance={result.image_max_distance}, "
+                    f"API max depth={result.api_max_depth}. "
+                    f"Image has {deep_extra} extra node(s) at distance ≥ 2. "
+                    f"This may indicate bridging through a non-reporting node "
+                    f"that the API cannot see (hidden path)."
+                )
         else:
             result.findings.append(
                 f"Image max distance ({result.image_max_distance}) slightly "
