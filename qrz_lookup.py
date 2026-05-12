@@ -58,23 +58,41 @@ class QRZLookup:
             logger.error(f"QRZ login failed: {e}")
             return False
 
+    @staticmethod
+    def _normalize_callsign(raw: str) -> str:
+        """Extract the first whitespace-delimited token and uppercase it.
+
+        Some upstream sources (e.g. AllStarLink stats records) pack location
+        into the callsign field, e.g. "<CALL> <City>". QRZ requires a bare
+        callsign, so trim to the first token before querying.
+        """
+        tokens = raw.split() if raw else []
+        return tokens[0].upper() if tokens else ""
+
     def lookup(self, callsign: str) -> Optional[dict]:
         """Look up a callsign and return operator info.
 
         Returns a dict with keys: callsign, email, fname, name, addr1, addr2,
         state, zip, country, or None on failure.
         """
+        normalized = self._normalize_callsign(callsign)
+        if not normalized:
+            logger.warning(f"QRZ lookup skipped: empty/invalid callsign input '{callsign}'")
+            return None
+        if normalized != callsign:
+            logger.info(f"QRZ lookup: normalized '{callsign}' → '{normalized}'")
+
         # Ensure we have a session key
         if not self._session_key:
             if not self._login():
                 return None
 
-        result = self._do_lookup(callsign)
+        result = self._do_lookup(normalized)
         if result is None:
             # Session key may have expired — retry with fresh login
             logger.info("Retrying QRZ lookup with fresh session key...")
             if self._login():
-                result = self._do_lookup(callsign)
+                result = self._do_lookup(normalized)
         return result
 
     def _do_lookup(self, callsign: str) -> Optional[dict]:
