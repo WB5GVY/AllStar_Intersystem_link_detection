@@ -64,6 +64,12 @@ class ScanResult:
     bridging_events: list[BridgingEvent]
     topology: dict[int, dict]        # node_id -> {depth, parent, role, ...}
     errors: list[str] = field(default_factory=list)
+    # True when API shows at least one triangle through the focus
+    # (focus↔A, focus↔B, A↔B all present). Bubble-map images of triangles
+    # are unreliable for distance-based hidden-path detection because the
+    # image-processor's straight-line edge tracer drops one of the routed-
+    # around edges. Used by cross_checker to suppress hidden-path alerts.
+    has_focus_triangle: bool = False
 
     @property
     def has_problems(self) -> bool:
@@ -169,30 +175,26 @@ class GraphAnalyzer:
                     )
                 continue
 
-            # Check for external connections (RepeaterPhone/EchoLink) on this hop-1 node
+            # External connections (RepeaterPhone / WebTransceiver / EchoLink) on a
+            # hop-1 node are PERMITTED regardless of whether the hop-1 is a designated
+            # bridge. These transports are inherently single-user "intimate" leaf
+            # endpoints: the AllStarLink protocol treats them as local to the node
+            # they attach to, and a node can only carry one of each transport type
+            # at a time. They cannot themselves bridge into another network, so
+            # tolerating them does not expose the focus system to foreign AllStar
+            # traffic. Recorded in topology with role=permitted_external for
+            # visibility, but no BridgingEvent is fired.
             external_connections = [d for d in hop1_details if d.get("is_external", False)]
-            if external_connections and not is_bridge:
-                # Non-bridge hop-1 node with an external connection = unauthorized bridging
-                # Bridge nodes are exempt — external connections (EchoLink, etc.) are their normal operation
-                for ext in external_connections:
-                    ext_name = ext.get("external_name", "Unknown")
-                    path = [self.focus_node, hop1_node]
-                    result.topology[f"ext_{hop1_node}_{ext_name}"] = {
-                        "depth": 2, "parent": hop1_node, "role": "unauthorized",
-                        "callsign": ext_name, "location": "External Connection",
-                    }
-                    event = BridgingEvent(
-                        offending_node=hop1_node,
-                        offending_callsign=hop1_info["callsign"],
-                        offending_location=hop1_info.get("location", "Unknown"),
-                        path=path,
-                        path_description=" → ".join(str(n) for n in path) + f" → [{ext_name}]",
-                        depth=1,
-                        rule=(f"Screen 2: non-bridge node {hop1_node} has external "
-                              f"connection '{ext_name}' (RepeaterPhone/EchoLink)"),
-                    )
-                    result.bridging_events.append(event)
-                    logger.warning(str(event))
+            for ext in external_connections:
+                ext_name = ext.get("external_name", "Unknown")
+                result.topology[f"ext_{hop1_node}_{ext_name}"] = {
+                    "depth": 2, "parent": hop1_node, "role": "permitted_external",
+                    "callsign": ext_name, "location": "External Connection",
+                }
+                logger.info(
+                    f"  Hop-1 node {hop1_node} ({hop1_info['callsign']}) has "
+                    f"external connection '{ext_name}' — permitted (transceive-like leaf)"
+                )
 
             hop1_links = [d["node_id"] for d in hop1_details
                           if not d.get("is_external", False) and d["node_id"] != 0]
@@ -204,9 +206,18 @@ class GraphAnalyzer:
                 if hop2_node == self.focus_node:
                     continue
                 if hop2_node in self.bridge_nodes:
-                    continue  # Bridge-to-bridge or bridge-to-focus is fine
+                    # Bridge-to-bridge link — also forms a triangle through the
+                    # focus (focus↔hop1, focus↔hop2, hop1↔hop2). The bubble-map
+                    # image-processor drops one of the routed-around edges of
+                    # such triangles, producing false hidden-path alerts; flag
+                    # so cross_checker can suppress.
+                    result.has_focus_triangle = True
+                    continue
                 if hop2_node in [n for n in hop0_links if n != hop1_node]:
-                    continue  # Link between two 1-hop nodes is fine
+                    # Two non-bridge 1-hop nodes that are also linked to each
+                    # other — same triangle structure.
+                    result.has_focus_triangle = True
+                    continue
                 if hop2_node in self.allowlist:
                     continue
                 if hop2_node in result.topology:
@@ -284,26 +295,22 @@ class GraphAnalyzer:
         detail_map_guest = {d["node_id"]: d for d in guest_details
                             if not d.get("is_external", False)}
 
-        # External connections on a guest node = bridging (e.g., RepeaterPhone)
+        # External connections on a guest node are PERMITTED — the operator-owned
+        # personal-hotspot pattern. See the matching block on the hop-1 path for
+        # the rationale. Recorded in topology with role=permitted_external for
+        # visibility; no BridgingEvent is fired. The numeric-AllStar-guest branch
+        # below still flags real foreign bridging.
         for ext in external_connections:
             ext_name = ext.get("external_name", "Unknown")
-            path = path_so_far + [ext_name]
             result.topology[f"ext_{ext_name}"] = {
-                "depth": 3, "parent": guest_node, "role": "unauthorized",
+                "depth": 3, "parent": guest_node, "role": "permitted_external",
                 "callsign": ext_name, "location": "External Connection",
             }
-            event = BridgingEvent(
-                offending_node=guest_node,
-                offending_callsign=result.topology.get(guest_node, {}).get("callsign", "Unknown"),
-                offending_location=result.topology.get(guest_node, {}).get("location", "Unknown"),
-                path=path_so_far,
-                path_description=" → ".join(str(n) for n in path_so_far) + f" → [{ext_name}]",
-                depth=2,
-                rule=(f"Screen 2: guest {guest_node} (via bridge {bridge_node}) "
-                      f"has external connection '{ext_name}' (RepeaterPhone/EchoLink)"),
+            guest_call = result.topology.get(guest_node, {}).get("callsign", "Unknown")
+            logger.info(
+                f"  Guest {guest_node} ({guest_call}) has external "
+                f"connection '{ext_name}' — permitted (transceive-like leaf)"
             )
-            result.bridging_events.append(event)
-            logger.warning(str(event))
 
         # Numeric node connections beyond the guest
         for hop3_node in guest_links:
