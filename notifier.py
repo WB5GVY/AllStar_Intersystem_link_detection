@@ -4,6 +4,7 @@ import logging
 import smtplib
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -192,11 +193,15 @@ class Notifier:
 
         return True, "ok"
 
-    def notify(self, scan_result: ScanResult) -> int:
+    def notify(self, scan_result: ScanResult,
+               bubble_image_path: Optional[str] = None) -> int:
         """Send notifications for all bridging events in a scan result.
 
         Quiet hours suppress sys admin emails but NOT offender courtesy emails.
         Rate limits apply to all notifications regardless of quiet hours.
+
+        If bubble_image_path is given (and the file exists), the bubble map JPEG
+        is attached to every email this notify cycle produces.
 
         Returns the number of notifications actually sent.
         """
@@ -211,7 +216,8 @@ class Notifier:
                 logger.info(f"Notification suppressed for node {event.offending_node}: {reason}")
                 continue
 
-            success = self._send_notification(event, scan_result, quiet)
+            success = self._send_notification(event, scan_result, quiet,
+                                              bubble_image_path)
             if success:
                 self.tracker.record_notification(event)
                 sent_count += 1
@@ -219,7 +225,8 @@ class Notifier:
         return sent_count
 
     def _send_notification(self, event: BridgingEvent, scan_result: ScanResult,
-                           quiet: bool = False) -> bool:
+                           quiet: bool = False,
+                           bubble_image_path: Optional[str] = None) -> bool:
         """Send notification via all enabled channels. Returns True if any succeeded."""
         any_success = False
 
@@ -227,13 +234,13 @@ class Notifier:
             if quiet:
                 logger.info(f"Sys admin email suppressed for node {event.offending_node}: quiet hours")
             else:
-                if self._send_email(event, scan_result):
+                if self._send_email(event, scan_result, bubble_image_path):
                     any_success = True
 
         # Send courtesy email to offending operator via QRZ lookup
         # Always sent regardless of quiet hours
         if self.qrz and self.email_config.get("enabled", False):
-            self._notify_offender(event, scan_result)
+            self._notify_offender(event, scan_result, bubble_image_path)
             any_success = True
 
         # If no channels produced output, just log
@@ -244,11 +251,36 @@ class Notifier:
 
         return any_success
 
-    def _send_email(self, event: BridgingEvent, scan_result: ScanResult) -> bool:
+    @staticmethod
+    def _resolve_attachment(image_path: Optional[str]) -> Optional[Path]:
+        """Validate an attachment path. Returns the Path if usable, else None
+        (also logs a warning when a path was supplied but the file is missing)."""
+        if not image_path:
+            return None
+        p = Path(image_path)
+        if not p.is_file():
+            logger.warning(f"Bubble attachment not found at {p}, sending without")
+            return None
+        return p
+
+    @staticmethod
+    def _attach_bubble(msg: MIMEMultipart, attach_path: Path) -> None:
+        """Attach a bubble JPEG to a MIMEMultipart('mixed') message."""
+        img_part = MIMEImage(attach_path.read_bytes(), _subtype="jpeg")
+        img_part.add_header(
+            "Content-Disposition", "attachment",
+            filename=attach_path.name,
+        )
+        msg.attach(img_part)
+
+    def _send_email(self, event: BridgingEvent, scan_result: ScanResult,
+                    bubble_image_path: Optional[str] = None) -> bool:
         """Send email notification for a bridging event."""
         try:
             cfg = self.email_config
-            msg = MIMEMultipart("alternative")
+            attach_path = self._resolve_attachment(bubble_image_path)
+            # "mixed" so we can carry both the text body and the JPEG attachment.
+            msg = MIMEMultipart("mixed")
             prefix = cfg.get("subject_prefix", "[ASL Link Alert]")
             msg["Subject"] = (
                 f"{prefix} Unauthorized bridging by node {event.offending_node} "
@@ -257,9 +289,16 @@ class Notifier:
             msg["From"] = cfg.get("from_addr", cfg.get("username", ""))
             msg["To"] = ", ".join(cfg.get("recipients", []))
 
-            # Plain text body
+            # Plain text body — note attachment if present
             body = self._format_email_body(event, scan_result)
+            if attach_path:
+                body += (
+                    f"\nThe bubble map captured at scan time is attached as "
+                    f"{attach_path.name}.\n"
+                )
             msg.attach(MIMEText(body, "plain"))
+            if attach_path:
+                self._attach_bubble(msg, attach_path)
 
             # Send
             server = smtplib.SMTP(cfg["smtp_server"], cfg.get("smtp_port", 587))
@@ -275,7 +314,10 @@ class Notifier:
 
             self._email_healthy = True
             self._last_email_send = datetime.now(timezone.utc).isoformat()
-            logger.info(f"Email sent for node {event.offending_node} to {cfg['recipients']}")
+            logger.info(
+                f"Email sent for node {event.offending_node} to {cfg['recipients']}"
+                + (f" with attachment {attach_path.name}" if attach_path else "")
+            )
             return True
 
         except Exception as e:
@@ -286,20 +328,33 @@ class Notifier:
     def send_hidden_path_alert(self, scan_timestamp: str,
                               image_max_distance: int,
                               api_max_depth: int,
-                              warnings: list[str]) -> bool:
+                              warnings: list[str],
+                              image_path: Optional[str] = None) -> bool:
         """Send an alert for hidden-path bridging detected by image but not API.
 
         This is a separate path from per-event notifications because the API
-        couldn't identify the specific offending node.
+        couldn't identify the specific offending node. If image_path is given
+        and the file exists, the bubble map is attached to the email so the
+        recipient can inspect the topology that triggered the alert.
         """
         if self.is_quiet_hours():
             logger.info("Hidden-path alert suppressed: quiet hours")
             return False
 
-        # Use general rate limits (not per-node, since we don't know the node)
+        # Use general rate limits (not per-node, since we don't know the node).
+        # Hourly cap and a daily safety net — the latter exists specifically to
+        # bound the blast radius of any future failure mode (e.g., a new bubble-
+        # analyzer artifact pattern that bypasses the triangle suppression).
         max_hourly = self.rate_limits.get("max_per_hour", 3)
         if self.tracker.count_recent(minutes=60.0) >= max_hourly:
             logger.info("Hidden-path alert suppressed: hourly rate limit")
+            return False
+        max_daily_hidden = self.rate_limits.get("max_per_day_hidden_path", 5)
+        if self.tracker.count_today() >= max_daily_hidden:
+            logger.info(
+                f"Hidden-path alert suppressed: daily safety net "
+                f"({max_daily_hidden}/day) reached"
+            )
             return False
 
         cfg = self.email_config
@@ -310,16 +365,32 @@ class Notifier:
             return False
 
         try:
-            msg = MIMEMultipart("alternative")
+            attach_path = self._resolve_attachment(image_path)
+
+            # Hidden-path alerts may have a narrower recipient list than regular
+            # bridging-event emails (see `hidden_path_recipients` in secrets).
+            # Falls back to the full recipient list when no override is set.
+            recipients = (
+                cfg.get("hidden_path_recipients")
+                or cfg.get("recipients", [])
+            )
+
+            # "mixed" so we can carry both the text body and the JPEG attachment.
+            msg = MIMEMultipart("mixed")
             prefix = cfg.get("subject_prefix", "[ASL Link Alert]")
             msg["Subject"] = (
                 f"{prefix} HIDDEN PATH — Image detects possible bridging "
                 f"(distance {image_max_distance})"
             )
             msg["From"] = cfg.get("from_addr", cfg.get("username", ""))
-            msg["To"] = ", ".join(cfg.get("recipients", []))
+            msg["To"] = ", ".join(recipients)
 
             warning_text = "\n".join(f"  - {w}" for w in warnings)
+            attach_note = (
+                f"\nThe bubble map captured at scan time is attached as "
+                f"{attach_path.name}.\n"
+                if attach_path else ""
+            )
             body = f"""AllStarLink HIDDEN PATH Bridging Alert
 =====================================
 
@@ -336,7 +407,7 @@ CROSS-CHECK WARNINGS:
 This is a HIDDEN PATH alert — the API cannot identify the specific
 offending node. Check the bubble map at:
   https://stats.allstarlink.org/stats/<FOCUS_NODE>/networkMap
-
+{attach_note}
 RECOMMENDED ACTION:
   Visually inspect the bubble map to identify the bridging path.
   The offending node may be a non-reporting guest node.
@@ -345,6 +416,8 @@ RECOMMENDED ACTION:
 This is an automated alert from the ASL Intersystem Link Detector.
 """
             msg.attach(MIMEText(body, "plain"))
+            if attach_path:
+                self._attach_bubble(msg, attach_path)
 
             server = smtplib.SMTP(cfg["smtp_server"], cfg.get("smtp_port", 587))
             if cfg.get("use_tls", True):
@@ -352,14 +425,17 @@ This is an automated alert from the ASL Intersystem Link Detector.
             server.login(cfg["username"], cfg["password"])
             server.sendmail(
                 cfg.get("from_addr", cfg["username"]),
-                cfg["recipients"],
+                recipients,
                 msg.as_string()
             )
             server.quit()
 
             self._email_healthy = True
             self._last_email_send = datetime.now(timezone.utc).isoformat()
-            logger.info(f"Hidden-path alert email sent to {cfg['recipients']}")
+            logger.info(
+                f"Hidden-path alert email sent to {recipients}"
+                + (f" with attachment {attach_path.name}" if attach_path else "")
+            )
             return True
 
         except Exception as e:
@@ -421,7 +497,8 @@ This is an automated alert from the ASL Intersystem Link Detector.
             logger.error(f"Test email failed: {e}")
             return False
 
-    def _notify_offender(self, event: BridgingEvent, scan_result: ScanResult):
+    def _notify_offender(self, event: BridgingEvent, scan_result: ScanResult,
+                         bubble_image_path: Optional[str] = None):
         """Look up the offending operator via QRZ and send a courtesy email."""
         callsign = event.offending_callsign
         if not callsign or callsign == "Unknown":
@@ -445,7 +522,8 @@ This is an automated alert from the ASL Intersystem Link Detector.
 
         try:
             cfg = self.email_config
-            msg = MIMEMultipart("alternative")
+            attach_path = self._resolve_attachment(bubble_image_path)
+            msg = MIMEMultipart("mixed")
             msg["Subject"] = (
                 f"AllStarLink — Courtesy notice regarding node "
                 f"{event.offending_node}"
@@ -458,7 +536,14 @@ This is an automated alert from the ASL Intersystem Link Detector.
             body = self._format_offender_email(
                 event, scan_result, offender_name, callsign
             )
+            if attach_path:
+                body += (
+                    f"\nThe bubble map captured at the time of detection is "
+                    f"attached as {attach_path.name} for your reference.\n"
+                )
             msg.attach(MIMEText(body, "plain"))
+            if attach_path:
+                self._attach_bubble(msg, attach_path)
 
             server = smtplib.SMTP(cfg["smtp_server"], cfg.get("smtp_port", 587))
             if cfg.get("use_tls", True):
@@ -474,6 +559,7 @@ This is an automated alert from the ASL Intersystem Link Detector.
 
             logger.info(
                 f"Offender courtesy email sent to {callsign} ({offender_email})"
+                + (f" with attachment {attach_path.name}" if attach_path else "")
             )
         except Exception as e:
             logger.error(f"Failed to send offender email to {callsign}: {e}")
@@ -559,7 +645,7 @@ DETECTION RULE:
 The offending node at depth {event.depth} is creating an unauthorized bridge
 between this repeater system and other networks.
 
-UNAUTHORIZED NODES PULLED IN:
+ADDITIONAL NODES CONNECTED VIA THE UNAUTHORIZED BRIDGING:
 {dragged_list}
 
 RECOMMENDED ACTION:

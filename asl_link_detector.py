@@ -15,11 +15,13 @@ Usage:
 import argparse
 import logging
 import logging.handlers
+import shutil
 import signal
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import yaml
 
@@ -107,7 +109,8 @@ def load_config(config_path: str) -> dict:
             # Merge email secrets into notifications.email
             if "email" in secrets:
                 email_cfg = config.setdefault("notifications", {}).setdefault("email", {})
-                for key in ("username", "password", "from_addr", "recipients"):
+                for key in ("username", "password", "from_addr",
+                            "recipients", "hidden_path_recipients"):
                     if key in secrets["email"] and secrets["email"][key]:
                         email_cfg[key] = secrets["email"][key]
 
@@ -123,6 +126,67 @@ def load_config(config_path: str) -> dict:
             logger.warning(f"Secrets file not found: {secrets_path}")
 
     return config
+
+
+HIDDEN_BUBBLE_DIR = Path(__file__).parent / "bubble_maps_hidden"
+EVENT_BUBBLE_DIR = Path(__file__).parent / "bubble_maps_events"
+BUBBLE_KEEP = 100  # Per-directory cap; oldest beyond this are pruned.
+
+
+def _preserve_bubble(src_path: str, scan_timestamp: str,
+                     dest_dir: Path, suffix: str) -> Optional[Path]:
+    """Copy a temp bubble map to a stable location, returning the new path.
+
+    Bubble maps are normally written to $TMPDIR with random tempfile names
+    and get purged by macOS — useless for retrospective inspection. This
+    helper preserves the scan-time image so it can be inspected later and
+    attached to outgoing alert emails.
+
+    Filename: <YYYY-MM-DD_HH-MM-SS><suffix>.jpg, sortable by time.
+    Directory is auto-pruned to BUBBLE_KEEP files (oldest first).
+    """
+    if not src_path:
+        return None
+    src = Path(src_path)
+    if not src.is_file():
+        logger.warning(f"Bubble image not found at {src}, cannot preserve")
+        return None
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        # ScanResult.timestamp is "%Y-%m-%dT%H:%M:%SZ" (UTC). Reformat to a
+        # filesystem-friendly, sortable name. Fall back to a wall-clock stamp
+        # if the format ever changes.
+        try:
+            dt = datetime.strptime(scan_timestamp, "%Y-%m-%dT%H:%M:%SZ")
+            stamp = dt.strftime("%Y-%m-%d_%H-%M-%S")
+        except ValueError:
+            stamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+        dst = dest_dir / f"{stamp}{suffix}.jpg"
+        shutil.copy2(src, dst)
+        logger.info(f"Preserved bubble map to {dst}")
+
+        existing = sorted(dest_dir.glob(f"*{suffix}.jpg"))
+        excess = len(existing) - BUBBLE_KEEP
+        if excess > 0:
+            for old in existing[:excess]:
+                try:
+                    old.unlink()
+                except OSError as e:
+                    logger.warning(f"Could not prune {old}: {e}")
+        return dst
+    except Exception as e:
+        logger.error(f"Failed to preserve bubble map: {e}")
+        return None
+
+
+def preserve_hidden_bubble(src_path: str, scan_timestamp: str) -> Optional[Path]:
+    """Preserve a bubble map that triggered a hidden-path alert."""
+    return _preserve_bubble(src_path, scan_timestamp, HIDDEN_BUBBLE_DIR, "_hidden")
+
+
+def preserve_event_bubble(src_path: str, scan_timestamp: str) -> Optional[Path]:
+    """Preserve a bubble map that accompanies a regular bridging-event alert."""
+    return _preserve_bubble(src_path, scan_timestamp, EVENT_BUBBLE_DIR, "_event")
 
 
 def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
@@ -189,17 +253,34 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
     if dry_run:
         logger.info("Dry run — notifications suppressed.")
     else:
-        sent = notifier.notify(result)
+        # Preserve the scan-time bubble map (if available) so it can be
+        # attached to every notification email this scan produces.
+        event_bubble = None
+        if (result.has_problems and crosscheck_result
+                and crosscheck_result.image_result):
+            event_bubble = preserve_event_bubble(
+                crosscheck_result.image_result.image_path,
+                result.timestamp,
+            )
+        sent = notifier.notify(
+            result,
+            bubble_image_path=str(event_bubble) if event_bubble else None,
+        )
         logger.info(f"Sent {sent} notification(s)")
 
         # Hidden-path alert: image detects bridging but API has no events
         if (crosscheck_result and crosscheck_result.possible_hidden_path_bridging
                 and not result.has_problems):
+            preserved = preserve_hidden_bubble(
+                crosscheck_result.image_result.image_path,
+                result.timestamp,
+            )
             notifier.send_hidden_path_alert(
                 scan_timestamp=result.timestamp,
                 image_max_distance=crosscheck_result.image_max_distance,
                 api_max_depth=crosscheck_result.api_max_depth,
                 warnings=crosscheck_result.warnings,
+                image_path=str(preserved) if preserved else None,
             )
 
     if collector:
