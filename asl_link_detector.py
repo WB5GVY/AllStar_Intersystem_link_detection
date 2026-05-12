@@ -337,10 +337,17 @@ def main():
 
     focus_node = config["focus_node"]
     bridge_nodes = config.get("bridge_nodes", [])
+    monitor_only = config.get("monitor_only", False)
     logger.info("AllStar Intersystem Link Detector starting")
     logger.info(f"Focus node: {focus_node}")
     logger.info(f"Bridge nodes: {bridge_nodes}")
     logger.info(f"Poll interval: {config.get('poll_interval_seconds', 300)}s")
+    if monitor_only:
+        logger.warning("=" * 60)
+        logger.warning("MONITOR-ONLY MODE: emails and auto-disconnect SUPPRESSED")
+        logger.warning("Scans run normally and log everything; no side effects.")
+        logger.warning("Set monitor_only: false in config.yaml + SIGHUP to go live.")
+        logger.warning("=" * 60)
 
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, handle_signal)
@@ -435,6 +442,19 @@ def main():
                         health_check_interval = config.get("status_server", {}).get(
                             "health_check_interval_seconds", 300
                         )
+                        new_monitor_only = config.get("monitor_only", False)
+                        if new_monitor_only != monitor_only:
+                            if new_monitor_only:
+                                logger.warning(
+                                    "MONITOR-ONLY MODE now ACTIVE — "
+                                    "emails and auto-disconnect SUPPRESSED"
+                                )
+                            else:
+                                logger.warning(
+                                    "MONITOR-ONLY MODE now DISABLED — "
+                                    "live operation resumed"
+                                )
+                            monitor_only = new_monitor_only
                         collector.update_config_reload(success=True)
                         collector.update_managed_nodes(disconnector)
                         logger.info("Config reloaded successfully.")
@@ -444,6 +464,7 @@ def main():
 
                 run_scan(analyzer, notifier, disconnector, focus_node,
                          api_client=api_client, collector=collector,
+                         dry_run=monitor_only,
                          enable_image_crosscheck=enable_image)
 
                 # Periodic SSH health and flag file checks
