@@ -619,13 +619,50 @@ questions, please contact the repeater support team.
 
     def _format_email_body(self, event: BridgingEvent, scan_result: ScanResult) -> str:
         """Format the email body for a bridging event."""
-        # Collect dragged-in nodes from the topology
+        # Collect dragged-in AllStar nodes from the topology
         dragged_in = [
             f"  - Node {nid} ({info.get('callsign', '?')}, {info.get('location', '?')})"
             for nid, info in scan_result.topology.items()
             if info.get("role") == "dragged_in"
         ]
         dragged_list = "\n".join(dragged_in[:20]) if dragged_in else "  (none detected beyond the offending node)"
+
+        # Collect non-AllStar endpoints (EchoLink or WebTransceiver-type IAX2
+        # softclients) anywhere in the scanned topology. These are surfaced
+        # from asl_api's schema-based classification: chan_echolink endpoints
+        # use the hardcoded "3%06u" name format (source-verified in
+        # AllStarLink/app_rpt chan_echolink.c); anything else with a name-only
+        # linkedNodes entry is treated as a WebTransceiver-type IAX2 softclient
+        # (WebTransceiver / AllScan / RepeaterPhone / generic softphone — the
+        # public stats API does not let us distinguish further, and the
+        # access_webtransceiver / access_telephoneportal capability flags are
+        # advertised intent, not operational truth).
+        non_allstar_lines = []
+        for nid, info in scan_result.topology.items():
+            ct = info.get("client_type")
+            if ct == "echolink":
+                # Display name carries the EchoLink-NNNNNN form
+                disp = info.get("callsign", "?")
+                parent = info.get("parent", "?")
+                # The trailing digits after "EchoLink-" are the EchoLink node ID
+                el_id = disp.split("-", 1)[1] if disp.startswith("EchoLink-") else "?"
+                non_allstar_lines.append(
+                    f"  - {disp} on host node {parent}"
+                    f"\n      EchoLink endpoint (node ID {el_id}, via chan_echolink)"
+                )
+            elif ct == "webtransceiver_type":
+                disp = info.get("callsign", "?")
+                parent = info.get("parent", "?")
+                non_allstar_lines.append(
+                    f"  - '{disp}' on host node {parent}"
+                    f"\n      WebTransceiver-type IAX2 softclient"
+                    f"\n      (WebTransceiver / AllScan / RepeaterPhone / generic"
+                    f" softphone — not distinguishable from stats API alone)"
+                )
+        if non_allstar_lines:
+            non_allstar_section = "\n".join(non_allstar_lines[:30])
+        else:
+            non_allstar_section = "  (none observed in this scan)"
 
         return f"""AllStarLink Unauthorized Bridging Alert
 ========================================
@@ -647,6 +684,9 @@ between this repeater system and other networks.
 
 ADDITIONAL NODES CONNECTED VIA THE UNAUTHORIZED BRIDGING:
 {dragged_list}
+
+NON-ALLSTAR ENDPOINTS OBSERVED IN THIS SCAN:
+{non_allstar_section}
 
 RECOMMENDED ACTION:
   Node {event.offending_node} ({event.offending_callsign}) should disconnect
