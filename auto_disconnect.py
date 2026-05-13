@@ -188,38 +188,66 @@ class AutoDisconnector:
                 success=True, action="skipped_reverify", message=msg
             )
 
-        # === Re-verify: does the target still have external connections? ===
+        # === Re-verify: does the target still bridge to another AllStar system? ===
+        # Per the 2026-05-13 policy update, non-AllStar leaf connections
+        # (WebTransceiver / RepeaterPhone / EchoLink-user / softphones) on the
+        # target are NOT, by themselves, grounds for disconnect. Those clients
+        # are protocol-limited single-hop terminating audio endpoints; they
+        # cannot themselves bridge our system to another repeater system. Only
+        # an AllStar-to-AllStar link from the target into a node outside our
+        # monitored set is a real bridging hazard. (See
+        # Intervention_and_Email_Rules.md and the journal entry of 2026-05-13.)
         target_details = self.api.get_linked_node_details(target)
         if target_details is not None and len(target_details) > 0:
-            # Check for non-numeric external connections (RepeaterPhone, EchoLink)
-            has_external_conn = any(
-                d.get("is_external", False) for d in target_details
-            )
-            # Check for numeric node connections outside the monitored system
             target_links = [d["node_id"] for d in target_details
                             if not d.get("is_external", False) and d["node_id"] != 0]
             external_nodes = [n for n in target_links if n != managed.node_id
                               and n not in self.managed_nodes]
+            ext_details = [d for d in target_details if d.get("is_external", False)]
 
-            if not has_external_conn and not external_nodes:
-                msg = (f"Node {target} no longer has external connections "
-                       f"during re-verify. No action needed.")
+            if not external_nodes:
+                # No AllStar bridging hazard remains. If non-AllStar externals
+                # are still present, log them in full for the forensic record
+                # (defensive addition per 2026-05-13 policy) — we are choosing
+                # NOT to disconnect for these.
+                if ext_details:
+                    skipped_externals = [
+                        f"'{d.get('external_name', '?')}' "
+                        f"(client_type={d.get('client_type', '?')})"
+                        for d in ext_details
+                    ]
+                    msg = (
+                        f"Node {target} has no AllStar links outside the "
+                        f"monitored system at re-verify. Non-AllStar externals "
+                        f"still present ({', '.join(skipped_externals)}) — "
+                        f"these are single-hop leaf endpoints and are not a "
+                        f"bridging hazard. No disconnect."
+                    )
+                else:
+                    msg = (
+                        f"Node {target} has no remaining bridging-relevant "
+                        f"connections at re-verify. No action needed."
+                    )
                 logger.info(msg)
                 return DisconnectResult(
                     managed_node=managed.node_id, target_node=target,
                     success=True, action="skipped_reverify", message=msg
                 )
-            if has_external_conn:
-                ext_names = [d.get("external_name", "?") for d in target_details
-                             if d.get("is_external", False)]
+            logger.info(
+                f"Re-verify confirmed: node {target} still has AllStar link(s) "
+                f"outside the monitored system: {external_nodes}"
+            )
+            if ext_details:
+                # Disconnect IS firing (because of external_nodes). Still log
+                # the non-AllStar externals so the alert email has full context.
+                ext_summary = [
+                    f"'{d.get('external_name', '?')}' "
+                    f"(client_type={d.get('client_type', '?')})"
+                    for d in ext_details
+                ]
                 logger.info(
-                    f"Re-verify confirmed: node {target} still has external "
-                    f"connection(s): {ext_names}"
-                )
-            if external_nodes:
-                logger.info(
-                    f"Re-verify confirmed: node {target} still has external "
-                    f"node connection(s): {external_nodes}"
+                    f"  Node {target} also carries non-AllStar external(s): "
+                    f"{', '.join(ext_summary)} — informational only."
                 )
 
         # === Flag file check: is auto-disconnect disabled by operator? ===
