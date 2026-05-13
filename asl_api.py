@@ -197,6 +197,22 @@ class ASLApiClient:
                 #
                 # External (non-AllStar) entries cannot be probed via this API,
                 # so they are flagged here to skip recursion in graph_analyzer.
+                #
+                # EchoLink user vs. conference (deferred, 2026-05-13):
+                # An EchoLink-NNNNNN endpoint may be a single-user EchoLink node
+                # OR an EchoLink conference room (e.g., *WX-TALK*, *JOTA*).
+                # EchoLink conferences CAN multi-bridge AllStar systems via
+                # multiple chan_echolink peers joined to the same conference.
+                # EchoLink itself assigns conference and user IDs from one
+                # sequential namespace — there is no numeric-range rule that
+                # distinguishes them (researched 2026-05-13, transcript at
+                # perplexity-research/2026-05-13_echolink_node_numbering_and_directory.json).
+                # If a future need arises, the path is to scrape
+                # https://www.echolink.org/validation/node_lookup.jsp for the
+                # callsign of a given EchoLink ID — conference callsigns are
+                # asterisk-bracketed. That work is currently deferred; we
+                # accept rare EchoLink-conference multi-bridge as residual
+                # risk per the 2026-05-13 policy discussion.
                 is_allstar = (
                     "Node_ID" in n
                     or "server" in n
