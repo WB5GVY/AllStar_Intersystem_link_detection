@@ -249,19 +249,30 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
         for event in result.bridging_events:
             logger.warning(str(event))
 
+    # Preserve the scan-time bubble map (if available) regardless of dry_run.
+    # In monitor-only / dry-run, we still want the JPG persisted into
+    # bubble_maps_events/ or bubble_maps_hidden/ for retroactive analysis —
+    # losing the image would defeat the purpose of a soak period for tuning.
+    # Only the actual email/SSH side effects are gated by dry_run below.
+    event_bubble = None
+    if (result.has_problems and crosscheck_result
+            and crosscheck_result.image_result):
+        event_bubble = preserve_event_bubble(
+            crosscheck_result.image_result.image_path,
+            result.timestamp,
+        )
+    hidden_bubble = None
+    if (crosscheck_result and crosscheck_result.possible_hidden_path_bridging
+            and not result.has_problems and crosscheck_result.image_result):
+        hidden_bubble = preserve_hidden_bubble(
+            crosscheck_result.image_result.image_path,
+            result.timestamp,
+        )
+
     # Send notifications (unless dry run)
     if dry_run:
         logger.info("Dry run — notifications suppressed.")
     else:
-        # Preserve the scan-time bubble map (if available) so it can be
-        # attached to every notification email this scan produces.
-        event_bubble = None
-        if (result.has_problems and crosscheck_result
-                and crosscheck_result.image_result):
-            event_bubble = preserve_event_bubble(
-                crosscheck_result.image_result.image_path,
-                result.timestamp,
-            )
         sent = notifier.notify(
             result,
             bubble_image_path=str(event_bubble) if event_bubble else None,
@@ -271,16 +282,12 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
         # Hidden-path alert: image detects bridging but API has no events
         if (crosscheck_result and crosscheck_result.possible_hidden_path_bridging
                 and not result.has_problems):
-            preserved = preserve_hidden_bubble(
-                crosscheck_result.image_result.image_path,
-                result.timestamp,
-            )
             notifier.send_hidden_path_alert(
                 scan_timestamp=result.timestamp,
                 image_max_distance=crosscheck_result.image_max_distance,
                 api_max_depth=crosscheck_result.api_max_depth,
                 warnings=crosscheck_result.warnings,
-                image_path=str(preserved) if preserved else None,
+                image_path=str(hidden_bubble) if hidden_bubble else None,
             )
 
     if collector:
