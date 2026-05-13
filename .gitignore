@@ -9,6 +9,13 @@ offender_email_draft.txt
 hotspot_test/
 hotspot_test_capture.sh
 
+# Operational rules summary (real recipient/node identifiers; local-only)
+Intervention_and_Email_Rules.md
+
+# Perplexity research transcripts (local-only)
+perplexity-research/
+.perplexity-research/
+
 # Development docs
 ASL_LinkDetection_Journal.md
 ASL_LinkDetection_Plan.md
