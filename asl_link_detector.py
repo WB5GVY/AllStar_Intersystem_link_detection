@@ -303,6 +303,9 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
         collector.update_email_health(notifier)
         collector.update_qrz_health(notifier)
         collector.update_notification_state(notifier)
+        # Refresh unusual-externals summary from the dedup table for HA
+        # (always — table state is meaningful even in monitor-only).
+        collector.update_unusual_externals()
 
     # === Phase 3: Auto-disconnect (after notification, not in dry-run) ===
     if result.has_problems and not dry_run:
@@ -392,6 +395,7 @@ def main():
     collector.attach_disconnector(disconnector)
     collector.record_startup()
     collector.update_managed_nodes(disconnector)
+    collector.update_monitor_only(monitor_only)
     status_cfg = config.get("status_server", {})
     health_check_interval = status_cfg.get("health_check_interval_seconds", 300)
     if status_cfg.get("enabled", True):
@@ -471,6 +475,7 @@ def main():
                                     "live operation resumed"
                                 )
                             monitor_only = new_monitor_only
+                        collector.update_monitor_only(monitor_only)
                         collector.update_config_reload(success=True)
                         collector.update_managed_nodes(disconnector)
                         logger.info("Config reloaded successfully.")

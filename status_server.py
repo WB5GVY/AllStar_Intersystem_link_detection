@@ -40,11 +40,23 @@ class StatusCollector:
         self.db_path = db_path
         self._bridge_nodes: set[int] = set()
         self._state = {
-            "version": "1.1",
+            "version": "1.2",
             "timestamp": None,
             "scan_ok": False,
+            "monitor_only": False,
             "violations": {"count": 0, "details": []},
-            "topology": {"total_nodes": 0, "focus_node_links": 0},
+            "topology": {
+                "total_nodes": 0,
+                "focus_node_links": 0,
+                # Counts of topology entries by client_type, set by update_scan().
+                # The classification is documented in asl_api.py near the
+                # endpoint-classification comment block. Added 2026-05-13.
+                "client_types": {
+                    "allstar": 0,
+                    "echolink": 0,
+                    "webtransceiver_type": 0,
+                },
+            },
             "managed_nodes": {},
             "last_violation": None,
             "last_disconnect": None,
@@ -55,6 +67,15 @@ class StatusCollector:
                 "suppressed": False,
                 "quiet_hours_active": False,
                 "rate_limited": False,
+            },
+            # Operator-awareness alerts for non-AllStar leaf peer names that
+            # match neither the amateur-callsign pattern nor EchoLink-NNNNNN.
+            # currently_observed reflects the live dedup-table rowcount.
+            # last_alert is the most recently inserted row (first_seen DESC).
+            # Added 2026-05-13.
+            "unusual_externals": {
+                "currently_observed": 0,
+                "last_alert": None,
             },
             "config": {"last_reload": None},
         }
@@ -159,11 +180,15 @@ class StatusCollector:
                 "rule": ev.rule,
             })
 
-        # Count focus node direct links from topology
+        # Count focus node direct links + client_type breakdown from topology
         focus_links = 0
+        client_type_counts = {"allstar": 0, "echolink": 0, "webtransceiver_type": 0}
         for node_id, info in result.topology.items():
             if info.get("depth") == 1:
                 focus_links += 1
+            ct = info.get("client_type")
+            if ct in client_type_counts:
+                client_type_counts[ct] += 1
 
         # Persist new violation rows (deduped) and pick the most recent for
         # last_violation. Done outside the lock — SQLite handles its own
@@ -211,6 +236,7 @@ class StatusCollector:
             self._state["topology"] = {
                 "total_nodes": len(result.topology),
                 "focus_node_links": focus_links,
+                "client_types": client_type_counts,
             }
             if new_last_violation is not None:
                 self._state["last_violation"] = new_last_violation
@@ -414,6 +440,50 @@ class StatusCollector:
                 self._state["config"]["last_reload"] = (
                     datetime.now(timezone.utc).isoformat()
                 )
+
+    def update_monitor_only(self, monitor_only: bool):
+        """Reflect the live `monitor_only` flag to HA. The flag determines
+        whether the detector will send emails and run SSH disconnect at all,
+        so it's the single most important sensor for "is this thing about to
+        act?" Added 2026-05-13."""
+        with self._lock:
+            self._state["monitor_only"] = bool(monitor_only)
+
+    def update_unusual_externals(self, db_path: Optional[str] = None):
+        """Refresh the unusual-externals summary from the SQLite dedup table.
+
+        Reads the row count (currently_observed) and the most recently inserted
+        row (last_alert). Called from the scan loop after
+        Notifier.process_unusual_externals() so the snapshot is consistent
+        with the alerts that just fired. Added 2026-05-13."""
+        path = db_path or self.db_path
+        currently_observed = 0
+        last_alert = None
+        try:
+            with sqlite3.connect(path) as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM unusual_externals"
+                ).fetchone()
+                currently_observed = int(row[0]) if row else 0
+                row = conn.execute(
+                    "SELECT host_node, external_name, client_type, first_seen "
+                    "FROM unusual_externals ORDER BY first_seen DESC LIMIT 1"
+                ).fetchone()
+                if row:
+                    last_alert = {
+                        "host_node": int(row[0]),
+                        "external_name": str(row[1]),
+                        "client_type": str(row[2] or ""),
+                        "first_seen": str(row[3]),
+                    }
+        except sqlite3.Error as e:
+            logger.warning(f"Could not refresh unusual_externals summary: {e}")
+            return
+        with self._lock:
+            self._state["unusual_externals"] = {
+                "currently_observed": currently_observed,
+                "last_alert": last_alert,
+            }
 
     def record_startup(self):
         """Record the initial config load timestamp at process startup.
