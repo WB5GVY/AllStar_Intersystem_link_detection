@@ -5,6 +5,10 @@ secrets.yaml
 # Live offender email template
 offender_email_draft.txt
 
+# Hotspot test harness and captures (contain real callsigns/node numbers)
+hotspot_test/
+hotspot_test_capture.sh
+
 # Development docs
 ASL_LinkDetection_Journal.md
 ASL_LinkDetection_Plan.md
