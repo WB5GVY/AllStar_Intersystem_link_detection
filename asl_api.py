@@ -168,30 +168,61 @@ class ASLApiClient:
             linked = stats_data.get("linkedNodes", [])
             results = []
             for n in linked:
-                # The "name" field is normally a numeric AllStar node ID, but:
-                #   - non-numeric values (callsigns) = RepeaterPhone/inbound EchoLink
-                #   - 7-digit numerics with leading 3 = outbound EchoLink (AllStar
-                #     reserves 3xxxxxx for the EchoLink number space)
-                # Both forms are external connections; the AllStar stats API does
-                # not serve them, so they must be flagged here to skip recursion.
-                name_raw = str(n.get("name", "0"))
-                is_echolink_numeric = (
-                    name_raw.isdigit()
-                    and len(name_raw) == 7
-                    and name_raw.startswith("3")
+                # Endpoint classification — schema-first, then name-pattern.
+                #
+                # The AllStarLink stats API returns linkedNodes entries in two
+                # distinct shapes:
+                #   (a) Real AllStar node: full registry record with Node_ID,
+                #       User_ID, callsign, server.*, ipaddr, regseconds, etc.
+                #   (b) Non-AllStar leaf: name-only object, e.g. {"name": "WB5GVY"}
+                #       or {"name": "3461188"} — no registry presence.
+                # Presence of Node_ID (or server / ipaddr) is therefore the strong
+                # AllStar-vs-not signal. We use that as the primary gate.
+                #
+                # Within the non-AllStar branch, distinguish EchoLink from
+                # WebTransceiver-type IAX2 softclients by the "name" pattern.
+                # chan_echolink encodes EchoLink endpoints with the format
+                # snprintf("3%06u", echolink_node_id) — source-verified in both
+                # legacy AllStarLink/ASL-Asterisk (chan_echolink.c:1269) and
+                # current ASL3 AllStarLink/app_rpt (chan_echolink.c:1796, 2516).
+                # That is: a 7-digit numeric name beginning with "3" is
+                # unambiguously an EchoLink endpoint. Any other name (typically
+                # a bare callsign, sometimes a custom iax.conf peer label) is a
+                # WebTransceiver-type softclient — the stats API does not
+                # distinguish WebTransceiver / AllScan / RepeaterPhone / generic
+                # IAX2 softphone, and the access_webtransceiver / access_telephoneportal
+                # flags on the host node are advertised intent, not operational
+                # truth (empirically verified 2026-05-12), so we do not use them
+                # for sub-classification.
+                #
+                # External (non-AllStar) entries cannot be probed via this API,
+                # so they are flagged here to skip recursion in graph_analyzer.
+                is_allstar = (
+                    "Node_ID" in n
+                    or "server" in n
+                    or "ipaddr" in n
                 )
-                if not name_raw.isdigit() or is_echolink_numeric:
+                name_raw = str(n.get("name", "0"))
+                if not is_allstar:
+                    is_echolink_numeric = (
+                        name_raw.isdigit()
+                        and len(name_raw) == 7
+                        and name_raw.startswith("3")
+                    )
                     if is_echolink_numeric:
-                        # Strip the "3" prefix and any leading zeros for display
-                        ext_name = f"EchoLink-{name_raw[1:].lstrip('0') or '0'}"
+                        echolink_id = name_raw[1:].lstrip('0') or '0'
+                        ext_name = f"EchoLink-{echolink_id}"
+                        client_type = "echolink"
                         kind = "EchoLink"
                     else:
                         ext_name = name_raw
-                        kind = "RepeaterPhone/EchoLink/etc."
+                        client_type = "webtransceiver_type"
+                        kind = "WebTransceiver-type IAX2 softclient"
                     results.append({
                         "node_id": 0,
                         "external_name": ext_name,
                         "is_external": True,
+                        "client_type": client_type,
                         "callsign": ext_name,
                         "location": "External Connection",
                         "frequency": "",
@@ -205,11 +236,20 @@ class ASLApiClient:
                         f"'{ext_name}' ({kind})"
                     )
                     continue
+                # AllStar node — use the full registry record. The "name" field
+                # holds the numeric AllStar node number for these entries
+                # (Node_ID is a separate AllStarLink-internal database key — do
+                # not confuse the two).
                 server = n.get("server", {}) or {}
                 regsec = n.get("regseconds", 0)
+                try:
+                    node_id_int = int(name_raw)
+                except (TypeError, ValueError):
+                    node_id_int = 0
                 results.append({
-                    "node_id": int(name_raw),
+                    "node_id": node_id_int,
                     "is_external": False,
+                    "client_type": "allstar",
                     "callsign": n.get("callsign", "Unknown"),
                     "location": server.get("Location", "Unknown"),
                     "frequency": n.get("node_frequency", ""),

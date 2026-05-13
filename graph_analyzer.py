@@ -125,6 +125,7 @@ class GraphAnalyzer:
 
         result.topology[self.focus_node] = {
             "depth": 0, "parent": None, "role": "focus",
+            "client_type": "allstar",
             "callsign": "Focus", "location": "Hub",
         }
         logger.info(f"Focus node {self.focus_node}: {len(hop0_links)} direct links: {hop0_links}")
@@ -144,6 +145,7 @@ class GraphAnalyzer:
 
             result.topology[node_id] = {
                 "depth": 1, "parent": self.focus_node, "role": role,
+                "client_type": "allstar",
                 "callsign": callsign, "location": location,
             }
 
@@ -189,6 +191,7 @@ class GraphAnalyzer:
                 ext_name = ext.get("external_name", "Unknown")
                 result.topology[f"ext_{hop1_node}_{ext_name}"] = {
                     "depth": 2, "parent": hop1_node, "role": "permitted_external",
+                    "client_type": ext.get("client_type", "webtransceiver_type"),
                     "callsign": ext_name, "location": "External Connection",
                 }
                 logger.info(
@@ -229,6 +232,7 @@ class GraphAnalyzer:
 
                 result.topology[hop2_node] = {
                     "depth": 2, "parent": hop1_node, "role": "guest" if is_bridge else "unauthorized",
+                    "client_type": "allstar",
                     "callsign": hop2_callsign, "location": hop2_location,
                 }
 
@@ -304,6 +308,7 @@ class GraphAnalyzer:
             ext_name = ext.get("external_name", "Unknown")
             result.topology[f"ext_{ext_name}"] = {
                 "depth": 3, "parent": guest_node, "role": "permitted_external",
+                "client_type": ext.get("client_type", "webtransceiver_type"),
                 "callsign": ext_name, "location": "External Connection",
             }
             guest_call = result.topology.get(guest_node, {}).get("callsign", "Unknown")
@@ -333,6 +338,7 @@ class GraphAnalyzer:
             path = path_so_far + [hop3_node]
             result.topology[hop3_node] = {
                 "depth": 3, "parent": guest_node, "role": "unauthorized",
+                "client_type": "allstar",
                 "callsign": hop3_callsign, "location": hop3_location,
             }
 
@@ -382,6 +388,7 @@ class GraphAnalyzer:
             location = d.get("location", "Unknown")
             result.topology[nid] = {
                 "depth": depth, "parent": node_id, "role": "dragged_in",
+                "client_type": "allstar",
                 "callsign": callsign, "location": location,
             }
             logger.info(f"  {'  ' * depth}Depth {depth}: node {nid} ({callsign}) dragged in")
