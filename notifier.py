@@ -32,7 +32,8 @@ CALLSIGN_LIKE = re.compile(r'^[A-Z]{1,2}\d[A-Z]{1,4}[A-Za-z0-9]*$')
 def is_unusual_external_name(name: str) -> bool:
     """True if `name` is a non-AllStar external peer name that does not match
     either an amateur radio callsign or the source-verified EchoLink-NNNNNN
-    format. Such names (e.g. 'DVSwitch', 'ASL-Audio', 'analog_bridge',
+    format. Such names (e.g. 'DVSwitch', 'IAX_Bridge', 'Analog_Bridge',
+    'MMDVM_Bridge', 'analog_bridge',
     'web_user_xyz') indicate a potentially cross-network bridge type and
     warrant operator notification per the 2026-05-13 policy."""
     if not name:
@@ -529,7 +530,8 @@ This is an automated alert from the ASL Intersystem Link Detector.
 
         Added 2026-05-13 as defensive addition #2 to the auto-disconnect
         policy relaxation. Sent to the full recipient list (all operators)
-        because an unusual peer name (e.g. 'DVSwitch', 'ASL-Audio',
+        because an unusual peer name (e.g. 'DVSwitch', 'IAX_Bridge',
+        'Analog_Bridge', 'MMDVM_Bridge',
         'analog_bridge') indicates a peer type that COULD bridge our system
         to a foreign network, even though it has not been detected doing so.
 
@@ -670,8 +672,9 @@ WHY THIS IS UNUSUAL:
   The peer name does not match the amateur-radio callsign pattern that
   WebTransceiver, RepeaterPhone, and softphone clients normally use, and
   it does not match the chan_echolink "EchoLink-NNNNNN" format. Peer
-  names like 'DVSwitch', 'ASL-Audio', 'analog_bridge', or arbitrary
-  session labels are placed in this category. The classifier flagged
+  names like 'DVSwitch', 'IAX_Bridge', 'Analog_Bridge', 'MMDVM_Bridge',
+  'analog_bridge', or arbitrary session labels are placed in this
+  category. The classifier flagged
   '{ext_name}' as not fitting either of the recognized patterns.
 
 WHAT THIS MEANS:
