@@ -271,7 +271,7 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
 
     # Send notifications (unless dry run)
     if dry_run:
-        logger.info("Dry run — notifications suppressed.")
+        logger.info("Dry run — notifications and unusual-external alerts suppressed.")
     else:
         sent = notifier.notify(
             result,
@@ -289,6 +289,15 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
                 warnings=crosscheck_result.warnings,
                 image_path=str(hidden_bubble) if hidden_bubble else None,
             )
+
+        # Unusual-external operator-awareness alert: a non-AllStar leaf whose
+        # peer name matches neither a callsign nor EchoLink-NNNNNN. Sent to
+        # all operators once per (host_node, peer_name) pair for the duration
+        # the peer is observed. Counts against the global email budget.
+        # Added 2026-05-13.
+        new_unusual = notifier.process_unusual_externals(result)
+        if new_unusual:
+            logger.info(f"Sent {new_unusual} unusual-external alert(s)")
 
     if collector:
         collector.update_email_health(notifier)

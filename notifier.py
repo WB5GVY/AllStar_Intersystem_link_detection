@@ -1,6 +1,7 @@
 """Notification system with rate limiting and quiet hours."""
 
 import logging
+import re
 import smtplib
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,28 @@ from qrz_lookup import QRZLookup
 logger = logging.getLogger(__name__)
 
 DB_FILE = "notifications.db"
+
+# A "looks like an amateur radio callsign" pattern. Accepts the FCC-style
+# 1-or-2-letter prefix + digit + 1-to-4-letter suffix, with an optional
+# alphanumeric mixed-case trailer (for things like "K1BLUMobile2" seen in
+# our logs). Anything that does NOT match this pattern and is NOT an
+# "EchoLink-NNNNNN" string is considered an UNUSUAL external — a candidate
+# for the one-shot all-operator alert added 2026-05-13. Tightening or
+# loosening this regex changes the alert sensitivity.
+CALLSIGN_LIKE = re.compile(r'^[A-Z]{1,2}\d[A-Z]{1,4}[A-Za-z0-9]*$')
+
+
+def is_unusual_external_name(name: str) -> bool:
+    """True if `name` is a non-AllStar external peer name that does not match
+    either an amateur radio callsign or the source-verified EchoLink-NNNNNN
+    format. Such names (e.g. 'DVSwitch', 'ASL-Audio', 'analog_bridge',
+    'web_user_xyz') indicate a potentially cross-network bridge type and
+    warrant operator notification per the 2026-05-13 policy."""
+    if not name:
+        return True
+    if name.startswith("EchoLink-"):
+        return False
+    return not CALLSIGN_LIKE.match(name)
 
 
 class NotificationTracker:
@@ -52,11 +75,65 @@ class NotificationTracker:
                 CREATE INDEX IF NOT EXISTS idx_notif_path_key
                 ON notifications(path_key)
             """)
+            # Dedup state for unusual-external alerts (one alert per
+            # (host_node, external_name) for the duration the external is
+            # observed; re-alert if it disappears and later reappears).
+            # Added 2026-05-13.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS unusual_externals (
+                    host_node INTEGER NOT NULL,
+                    external_name TEXT NOT NULL,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    client_type TEXT,
+                    PRIMARY KEY (host_node, external_name)
+                )
+            """)
 
     @staticmethod
     def _make_path_key(event: BridgingEvent) -> str:
         """Create a unique key from the violation path."""
         return event.path_description
+
+    def get_alerted_unusual_externals(self) -> set[tuple[int, str]]:
+        """Return the set of (host_node, external_name) we've already alerted on."""
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT host_node, external_name FROM unusual_externals"
+            ).fetchall()
+        return {(int(h), str(n)) for h, n in rows}
+
+    def mark_unusual_external_alerted(self, host_node: int, external_name: str,
+                                       client_type: Optional[str], now_iso: str):
+        """Record that we have sent an alert for this (host_node, external_name)."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO unusual_externals "
+                "(host_node, external_name, first_seen, last_seen, client_type) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (int(host_node), str(external_name), now_iso, now_iso,
+                 client_type or ""),
+            )
+
+    def touch_unusual_external(self, host_node: int, external_name: str,
+                                now_iso: str):
+        """Update last_seen for a still-observed unusual external."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE unusual_externals SET last_seen = ? "
+                "WHERE host_node = ? AND external_name = ?",
+                (now_iso, int(host_node), str(external_name)),
+            )
+
+    def clear_unusual_external(self, host_node: int, external_name: str):
+        """Remove a (host_node, external_name) row — the external is no longer
+        observed, so the next reappearance should re-alert."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "DELETE FROM unusual_externals "
+                "WHERE host_node = ? AND external_name = ?",
+                (int(host_node), str(external_name)),
+            )
 
     def record_notification(self, event: BridgingEvent):
         """Record that a notification was sent for this event."""
@@ -441,6 +518,215 @@ This is an automated alert from the ASL Intersystem Link Detector.
         except Exception as e:
             self._email_healthy = False
             logger.error(f"Failed to send hidden-path alert email: {e}")
+            return False
+
+    def process_unusual_externals(self, scan_result: ScanResult) -> int:
+        """Scan topology for unusual non-AllStar externals and emit one-shot
+        operator alerts. Dedupe state lives in `unusual_externals` table:
+        once we alert on a (host_node, external_name) pair, we do not re-alert
+        while that pair remains observed. If it disappears and later returns,
+        the next appearance re-alerts.
+
+        Added 2026-05-13 as defensive addition #2 to the auto-disconnect
+        policy relaxation. Sent to the full recipient list (all operators)
+        because an unusual peer name (e.g. 'DVSwitch', 'ASL-Audio',
+        'analog_bridge') indicates a peer type that COULD bridge our system
+        to a foreign network, even though it has not been detected doing so.
+
+        Returns the number of new alerts sent in this scan.
+        """
+        if not self.email_config.get("enabled", False):
+            return 0
+
+        # Collect (host_node, external_name, client_type) for all unusual
+        # externals in this scan's topology.
+        observed: dict[tuple[int, str], dict] = {}
+        for key, info in scan_result.topology.items():
+            if info.get("role") != "permitted_external":
+                continue
+            ext_name = info.get("callsign", "")
+            if not is_unusual_external_name(ext_name):
+                continue
+            try:
+                host_node = int(info.get("parent") or 0)
+            except (TypeError, ValueError):
+                host_node = 0
+            if host_node == 0:
+                continue
+            observed[(host_node, ext_name)] = {
+                "host_node": host_node,
+                "external_name": ext_name,
+                "client_type": info.get("client_type", "webtransceiver_type"),
+                "host_info": scan_result.topology.get(host_node, {}),
+                "scan_timestamp": scan_result.timestamp,
+            }
+
+        alerted_before = self.tracker.get_alerted_unusual_externals()
+        now_iso = datetime.utcnow().isoformat()
+
+        # Clear rows that are no longer observed — next reappearance re-alerts.
+        gone = alerted_before - set(observed.keys())
+        for host_node, ext_name in gone:
+            logger.info(
+                f"Unusual external '{ext_name}' on node {host_node} no longer "
+                f"observed; clearing dedup state so any future reappearance "
+                f"will re-alert."
+            )
+            self.tracker.clear_unusual_external(host_node, ext_name)
+
+        # New unusual externals — emit one alert per (host_node, ext_name).
+        new_alerts = 0
+        for pair, ctx in observed.items():
+            if pair in alerted_before:
+                # Still observed — touch last_seen, no email.
+                self.tracker.touch_unusual_external(pair[0], pair[1], now_iso)
+                continue
+            # Email volume gate: same per-window / per-day caps as other
+            # sysadmin emails. We piggyback on the rate_limits config; if the
+            # global hourly/daily caps are exhausted, defer the alert (it will
+            # re-fire on a later scan, still as a "new" alert because the row
+            # has not yet been inserted).
+            if not self._unusual_external_volume_ok():
+                logger.info(
+                    f"Unusual-external alert for '{ctx['external_name']}' on "
+                    f"node {ctx['host_node']} deferred: email volume limit."
+                )
+                continue
+            if self._send_unusual_external_alert(ctx):
+                self.tracker.mark_unusual_external_alerted(
+                    ctx["host_node"], ctx["external_name"],
+                    ctx.get("client_type"), now_iso,
+                )
+                new_alerts += 1
+        return new_alerts
+
+    def _unusual_external_volume_ok(self) -> bool:
+        """Apply the per-window / per-day caps from rate_limits config to
+        unusual-external alerts. Counts both bridging-event emails (rows in
+        `notifications`) and prior unusual-external alerts (rows in
+        `unusual_externals` whose `first_seen` falls inside the window) so
+        the global email budget is honored regardless of channel."""
+        window_min = self.rate_limits.get("window_minutes", 15)
+        max_per_window = self.rate_limits.get("max_per_window", 2)
+        max_daily = self.rate_limits.get("max_per_day", 24)
+        cutoff_window = (datetime.utcnow() - timedelta(minutes=window_min)).isoformat()
+        cutoff_day = (datetime.utcnow() - timedelta(days=1)).isoformat()
+        with sqlite3.connect(self.tracker.db_path) as conn:
+            in_window = conn.execute(
+                "SELECT COUNT(*) FROM notifications WHERE timestamp > ?",
+                (cutoff_window,),
+            ).fetchone()[0]
+            in_window += conn.execute(
+                "SELECT COUNT(*) FROM unusual_externals WHERE first_seen > ?",
+                (cutoff_window,),
+            ).fetchone()[0]
+            in_day = conn.execute(
+                "SELECT COUNT(*) FROM notifications WHERE timestamp > ?",
+                (cutoff_day,),
+            ).fetchone()[0]
+            in_day += conn.execute(
+                "SELECT COUNT(*) FROM unusual_externals WHERE first_seen > ?",
+                (cutoff_day,),
+            ).fetchone()[0]
+        return in_window < max_per_window and in_day < max_daily
+
+    def _send_unusual_external_alert(self, ctx: dict) -> bool:
+        """Send a single all-operator email for one newly observed unusual
+        external. Uses the full `recipients` list — this is an operator
+        awareness alert, not an anomaly/uncertainty alert."""
+        cfg = self.email_config
+        recipients = cfg.get("recipients", [])
+        if not recipients:
+            logger.error("Unusual-external alert skipped: recipients list is empty.")
+            return False
+
+        host_node = ctx["host_node"]
+        ext_name = ctx["external_name"]
+        client_type = ctx.get("client_type", "webtransceiver_type")
+        host_info = ctx.get("host_info", {}) or {}
+        host_callsign = host_info.get("callsign", "?")
+        host_location = host_info.get("location", "?")
+        host_role = host_info.get("role", "?")
+
+        prefix = cfg.get("subject_prefix", "[ASL Link Alert]")
+        subject = (
+            f"{prefix} UNUSUAL external '{ext_name}' observed on node "
+            f"{host_node} ({host_callsign})"
+        )
+        body = f"""AllStarLink Unusual External Connection — Operator Awareness Alert
+====================================================================
+
+Detected at: {ctx.get('scan_timestamp', '?')}
+
+UNUSUAL EXTERNAL:
+  Peer name:        '{ext_name}'
+  Client type:      {client_type}
+  Host node:        {host_node}
+  Host callsign:    {host_callsign}
+  Host location:    {host_location}
+  Host role:        {host_role}
+
+WHY THIS IS UNUSUAL:
+  The peer name does not match the amateur-radio callsign pattern that
+  WebTransceiver, RepeaterPhone, and softphone clients normally use, and
+  it does not match the chan_echolink "EchoLink-NNNNNN" format. Peer
+  names like 'DVSwitch', 'ASL-Audio', 'analog_bridge', or arbitrary
+  session labels are placed in this category. The classifier flagged
+  '{ext_name}' as not fitting either of the recognized patterns.
+
+WHAT THIS MEANS:
+  This connection has NOT been detected as forming a bridge to other
+  networks or repeater systems. The detector continues to allow it as
+  a permitted leaf attachment to node {host_node}. However, peer types
+  that fall outside the recognized callsign / EchoLink-NNNNNN patterns
+  CAN have the potential to bridge an AllStar system to other networks
+  (for example, DVSwitch is designed to bridge AllStar audio to DMR,
+  D-Star, YSF, NXDN, or other digital-voice networks). We do not have
+  enough information from the public stats API alone to distinguish a
+  benign unusual peer name from a true cross-network bridge.
+
+RECIPIENT NOTE:
+  This is an operator-awareness email sent once per (host node, peer
+  name) pair when the unusual peer is first observed. No further email
+  will be sent while this connection persists. If the connection
+  disappears and later reappears, a fresh alert will fire.
+
+NO INTERVENTION:
+  No auto-disconnect has been or will be performed for this connection.
+  The detector continues to monitor for the actual bridging signature
+  (an AllStar-to-AllStar link from a non-bridge node to a node outside
+  the monitored system), which has not been observed here.
+
+---
+This is an automated alert from the ASL Intersystem Link Detector.
+"""
+
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = subject
+            msg["From"] = cfg.get("from_addr", cfg.get("username", ""))
+            msg["To"] = ", ".join(recipients)
+            msg.attach(MIMEText(body, "plain"))
+
+            with smtplib.SMTP(cfg["smtp_server"], cfg["smtp_port"]) as server:
+                if cfg.get("use_tls", True):
+                    server.starttls()
+                server.login(cfg["username"], cfg["password"])
+                server.sendmail(
+                    cfg.get("from_addr", cfg["username"]),
+                    recipients,
+                    msg.as_string(),
+                )
+            self._email_healthy = True
+            self._last_email_send = datetime.utcnow().isoformat()
+            logger.warning(
+                f"Unusual-external alert sent to {recipients} for "
+                f"'{ext_name}' on node {host_node}."
+            )
+            return True
+        except Exception as e:
+            self._email_healthy = False
+            logger.error(f"Failed to send unusual-external alert: {e}")
             return False
 
     def send_test_email(self) -> bool:
