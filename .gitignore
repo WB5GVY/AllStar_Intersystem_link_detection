@@ -16,6 +16,9 @@ Intervention_and_Email_Rules.md
 perplexity-research/
 .perplexity-research/
 
+# HA dashboard / Lovelace YAML example (local-only; references real LAN host)
+HA_Lovelace_Card.md
+
 # Development docs
 ASL_LinkDetection_Journal.md
 ASL_LinkDetection_Plan.md
