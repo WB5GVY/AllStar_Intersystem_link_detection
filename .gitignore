@@ -93,3 +93,5 @@ build/
 venv/
 .venv/
 env/
+last_restart_times.txt
+PANIC_STOPPED

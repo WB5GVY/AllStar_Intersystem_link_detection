@@ -15,11 +15,12 @@ Usage:
 import argparse
 import logging
 import logging.handlers
+import os
 import shutil
 import signal
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -30,7 +31,7 @@ from auto_disconnect import AutoDisconnector
 from bubble_analyzer import fetch_and_analyze
 from cross_checker import cross_check
 from graph_analyzer import GraphAnalyzer
-from notifier import Notifier
+from notifier import Notifier, RecipientResolutionError
 from status_server import StatusCollector, start_status_server
 
 logger = logging.getLogger("asl_link_detector")
@@ -110,7 +111,8 @@ def load_config(config_path: str) -> dict:
             if "email" in secrets:
                 email_cfg = config.setdefault("notifications", {}).setdefault("email", {})
                 for key in ("username", "password", "from_addr",
-                            "recipients", "hidden_path_recipients"):
+                            "recipients", "hidden_path_recipients",
+                            "internal_recipients"):
                     if key in secrets["email"] and secrets["email"][key]:
                         email_cfg[key] = secrets["email"][key]
 
@@ -131,6 +133,77 @@ def load_config(config_path: str) -> dict:
 HIDDEN_BUBBLE_DIR = Path(__file__).parent / "bubble_maps_hidden"
 EVENT_BUBBLE_DIR = Path(__file__).parent / "bubble_maps_events"
 BUBBLE_KEEP = 100  # Per-directory cap; oldest beyond this are pruned.
+
+RESTART_LOG = Path(__file__).parent / "last_restart_times.txt"
+PANIC_FILE = Path(__file__).parent / "PANIC_STOPPED"
+
+
+def check_restart_loop(max_restarts: int, window_minutes: int) -> None:
+    """S5 daemon-side restart-storm guard.
+
+    Append the current restart timestamp to RESTART_LOG and check whether
+    the last `max_restarts` entries all fall within the trailing
+    `window_minutes` window. If so, write a PANIC_STOPPED file and exit
+    non-zero. launchd's KeepAlive: SuccessfulExit=false will keep
+    re-launching, but the panic file causes immediate exit until a human
+    clears it. This is the only mechanism that stops a tight crash loop
+    from amortizing across launchd's 5-minute ThrottleInterval.
+    """
+    now = datetime.utcnow()
+    if PANIC_FILE.exists():
+        # A human must clear the panic file to resume. Exit fast so we
+        # don't hog CPU under launchd's KeepAlive.
+        sys.stderr.write(
+            f"PANIC_STOPPED present at {PANIC_FILE} — refusing to start. "
+            f"Investigate, then 'rm {PANIC_FILE}' to resume.\n"
+        )
+        sys.exit(2)
+    try:
+        history = []
+        if RESTART_LOG.exists():
+            for line in RESTART_LOG.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    history.append(datetime.fromisoformat(line))
+                except ValueError:
+                    continue
+        history.append(now)
+        # Trim to last 50 entries.
+        history = history[-50:]
+        RESTART_LOG.write_text("\n".join(t.isoformat() for t in history) + "\n")
+
+        cutoff = now - timedelta(minutes=window_minutes)
+        recent = [t for t in history if t >= cutoff]
+        if len(recent) >= max_restarts:
+            PANIC_FILE.write_text(
+                f"Panic-stopped at {now.isoformat()}Z\n"
+                f"{len(recent)} restarts in last {window_minutes} minutes "
+                f"(threshold {max_restarts}).\n"
+                f"\nRecovery: remove this file to resume. The restart-time\n"
+                f"history at {RESTART_LOG} has been truncated so the next\n"
+                f"start does not immediately re-trip the panic guard.\n"
+            )
+            # S-1 fix (2026-05-15 self-review): truncate the restart log
+            # when writing the panic file so manual recovery (deleting
+            # PANIC_STOPPED) does not immediately re-trip the guard with
+            # the same accumulated history.
+            try:
+                RESTART_LOG.write_text("")
+            except Exception:
+                pass
+            sys.stderr.write(
+                f"PANIC: {len(recent)} restarts in last {window_minutes} "
+                f"minutes; wrote {PANIC_FILE}. Exiting.\n"
+            )
+            sys.exit(2)
+    except SystemExit:
+        raise
+    except Exception as e:
+        # If the guard itself fails, log to stderr but let the daemon start
+        # (do not chain-fail the guard).
+        sys.stderr.write(f"Restart-loop guard error: {e}\n")
 
 
 def _preserve_bubble(src_path: str, scan_timestamp: str,
@@ -354,6 +427,16 @@ def main():
     config = load_config(args.config)
     setup_logging(config)
 
+    # S5 daemon-side restart-storm guard. If launchd is hot-restarting us
+    # because something keeps crashing, write a panic file and refuse to
+    # start until a human clears it. Skip for one-shot invocations.
+    if not (args.once or args.dry_run or args.test_email):
+        restart_cfg = config.get("restart_loop", {})
+        check_restart_loop(
+            max_restarts=int(restart_cfg.get("max_restarts", 5)),
+            window_minutes=int(restart_cfg.get("window_minutes", 30)),
+        )
+
     focus_node = config["focus_node"]
     bridge_nodes = config.get("bridge_nodes", [])
     monitor_only = config.get("monitor_only", False)
@@ -373,11 +456,34 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGHUP, handle_sighup)
 
-    # Handle --test-email early (only needs config + notifier)
-    notifier = Notifier(config)
+    # Construct notifier. Fails-closed if internal_recipients is missing.
+    try:
+        notifier = Notifier(config)
+    except RecipientResolutionError as e:
+        logger.error(
+            "Refusing to start — recipient resolution failed:\n%s\n"
+            "Add an 'internal_recipients: [<bennett@email>]' line under "
+            "notifications.email in secrets.yaml and try again.", e
+        )
+        sys.exit(2)
+
+    # --test-email is gated by env var (S1). It also goes to Bennett only.
     if args.test_email:
+        if os.environ.get("ASL_ALLOW_TEST_EMAIL") != "1":
+            logger.error(
+                "Refusing to send test email: set ASL_ALLOW_TEST_EMAIL=1 "
+                "in the environment to authorize. This is gated to prevent "
+                "accidental sends from cron / launchd / typo'd argv."
+            )
+            sys.exit(2)
+        # Test email is a real send, not a dry-run scenario.
+        notifier.set_dry_run(False)
         success = notifier.send_test_email()
         sys.exit(0 if success else 1)
+
+    # Apply the initial dry-run state to the notifier so the chokepoint's
+    # defense-in-depth gate knows we are in monitor-only (if applicable).
+    notifier.set_dry_run(monitor_only)
 
     # Initialize remaining components
     api_client = ASLApiClient()
@@ -412,9 +518,14 @@ def main():
 
     try:
         if args.once or args.dry_run:
-            run_scan(analyzer, notifier, disconnector, focus_node,
-                     api_client=api_client, collector=collector,
-                     dry_run=args.dry_run, enable_image_crosscheck=enable_image)
+            notifier.set_dry_run(args.dry_run or monitor_only)
+            try:
+                run_scan(analyzer, notifier, disconnector, focus_node,
+                         api_client=api_client, collector=collector,
+                         dry_run=args.dry_run, enable_image_crosscheck=enable_image)
+            except Exception as e:
+                logger.exception("run_scan crashed: %s", e)
+                notifier.report_error("Scan crashed (single-shot)", str(e), exc=e)
             # Run health checks once for single-scan modes
             try:
                 ssh_results = disconnector.check_ssh_health()
@@ -448,21 +559,44 @@ def main():
                 if _reload_config:
                     _reload_config = False
                     logger.info("Reloading config.yaml...")
+                    # C8 fix: build a fully-loaded new namespace first;
+                    # only swap bindings if every step succeeded. Any
+                    # exception leaves the previous config running.
                     try:
-                        config = load_config(args.config)
-                        disconnector = AutoDisconnector(config, api_client)
-                        analyzer = GraphAnalyzer(
+                        new_config = load_config(args.config)
+                        new_focus_node = new_config["focus_node"]
+                        new_disconnector = AutoDisconnector(new_config, api_client)
+                        new_analyzer = GraphAnalyzer(
                             api_client=api_client,
-                            focus_node=config["focus_node"],
-                            bridge_nodes=config.get("bridge_nodes", []),
-                            allowlist=config.get("allowlist", []),
-                            stale_threshold_minutes=config.get("stale_threshold_minutes", 120),
+                            focus_node=new_focus_node,
+                            bridge_nodes=new_config.get("bridge_nodes", []),
+                            allowlist=new_config.get("allowlist", []),
+                            stale_threshold_minutes=new_config.get(
+                                "stale_threshold_minutes", 120),
                         )
-                        focus_node = config["focus_node"]
-                        health_check_interval = config.get("status_server", {}).get(
-                            "health_check_interval_seconds", 300
-                        )
-                        new_monitor_only = config.get("monitor_only", False)
+                        new_notifier = Notifier(new_config)
+                        new_monitor_only = new_config.get("monitor_only", False)
+                        new_health_interval = new_config.get(
+                            "status_server", {}
+                        ).get("health_check_interval_seconds", 300)
+                    except Exception as e:
+                        collector.update_config_reload(success=False)
+                        logger.error("Config reload failed: %s. "
+                                     "Keeping previous config.", e)
+                        try:
+                            notifier.report_error(
+                                "Config reload failed", str(e), exc=e
+                            )
+                        except Exception as report_err:
+                            logger.error("report_error failed: %s", report_err)
+                    else:
+                        # Atomic rebind — all-or-nothing.
+                        config = new_config
+                        disconnector = new_disconnector
+                        analyzer = new_analyzer
+                        focus_node = new_focus_node
+                        notifier = new_notifier
+                        health_check_interval = new_health_interval
                         if new_monitor_only != monitor_only:
                             if new_monitor_only:
                                 logger.warning(
@@ -475,18 +609,24 @@ def main():
                                     "live operation resumed"
                                 )
                             monitor_only = new_monitor_only
+                        notifier.set_dry_run(monitor_only)
                         collector.update_monitor_only(monitor_only)
                         collector.update_config_reload(success=True)
                         collector.update_managed_nodes(disconnector)
                         logger.info("Config reloaded successfully.")
-                    except Exception as e:
-                        collector.update_config_reload(success=False)
-                        logger.error(f"Config reload failed: {e}. Continuing with previous config.")
 
-                run_scan(analyzer, notifier, disconnector, focus_node,
-                         api_client=api_client, collector=collector,
-                         dry_run=monitor_only,
-                         enable_image_crosscheck=enable_image)
+                notifier.set_dry_run(monitor_only)
+                try:
+                    run_scan(analyzer, notifier, disconnector, focus_node,
+                             api_client=api_client, collector=collector,
+                             dry_run=monitor_only,
+                             enable_image_crosscheck=enable_image)
+                except Exception as e:
+                    logger.exception("run_scan crashed: %s", e)
+                    try:
+                        notifier.report_error("Scan crashed", str(e), exc=e)
+                    except Exception as report_err:
+                        logger.error("report_error failed: %s", report_err)
 
                 # Periodic SSH health and flag file checks
                 now_ts = time.time()
