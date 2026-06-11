@@ -27,7 +27,7 @@ Detection rules:
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from asl_api import ASLApiClient
 from dns_checker import check_node_dns
@@ -64,6 +64,13 @@ class ScanResult:
     bridging_events: list[BridgingEvent]
     topology: dict[int, dict]        # node_id -> {depth, parent, role, ...}
     errors: list[str] = field(default_factory=list)
+    # Undirected union of every reported numeric link seen during the walk,
+    # as frozenset({a, b}) pairs. Unlike `topology` (a directed tree rooted at
+    # the focus), this preserves cross-links — letting cross_checker compute
+    # EXACT BFS distances and detect bridges through non-reporting nodes from
+    # structured data, replacing the error-prone bubble-map CV (Item B,
+    # 2026-06-11). Shadow-mode only for now; not yet an alerting source.
+    edges: set = field(default_factory=set)
     # True when API shows at least one triangle through the focus
     # (focus↔A, focus↔B, A↔B all present). Bubble-map images of triangles
     # are unreliable for distance-based hidden-path detection because the
@@ -93,6 +100,54 @@ class GraphAnalyzer:
         self.bridge_nodes = set(bridge_nodes)
         self.allowlist = set(allowlist or [])
         self.stale_threshold_minutes = stale_threshold_minutes
+        # Optional callback fired exactly once per scan, the instant the FIRST
+        # bridging event is detected — used to trigger immediate bubble-map
+        # evidence capture before the (potentially minutes-long) deep drag-in
+        # walk finishes and before the offending link can self-resolve.
+        # Receives the in-progress ScanResult. Exceptions are swallowed so a
+        # capture failure can never abort a scan.
+        self.on_first_detection: Optional[Callable[["ScanResult"], None]] = None
+        self._detection_fired = False
+
+    def _fetch_details(self, node_id: int, result: "ScanResult"):
+        """Fetch a node's linked-node details AND record its numeric links into
+        the undirected edge union (result.edges).
+
+        Thin wrapper around the API call: return value is unchanged (None on
+        API error, [] for a non-reporting node), so all existing control flow
+        is untouched. The only side effect is populating result.edges for the
+        structured hidden-path analysis (Item B). External (RepeaterPhone /
+        WebTransceiver / EchoLink) pseudo-links and node_id 0 are excluded —
+        they are leaf transports, not graph edges.
+        """
+        details = self.api.get_linked_node_details(node_id)
+        if details:
+            for d in details:
+                nid = d.get("node_id", 0)
+                # Skip node_id 0, external pseudo-links, and any self-loop
+                # (a 1-element frozenset would break the BFS edge unpack).
+                if nid and nid != node_id and not d.get("is_external", False):
+                    result.edges.add(frozenset((node_id, nid)))
+        return details
+
+    def _emit_event(self, result: "ScanResult", event: "BridgingEvent") -> None:
+        """Record a bridging event and fire the first-detection callback once.
+
+        Centralizes event recording so immediate evidence capture is triggered
+        the moment the FIRST violation is seen in a scan, rather than after the
+        full topology walk completes (which can take minutes and outlast a
+        transient offending link).
+        """
+        result.bridging_events.append(event)
+        logger.warning(str(event))
+        if not self._detection_fired:
+            self._detection_fired = True
+            cb = self.on_first_detection
+            if cb is not None:
+                try:
+                    cb(result)
+                except Exception as e:  # never let capture abort a scan
+                    logger.error(f"on_first_detection callback failed: {e}")
 
     def scan(self) -> ScanResult:
         """Perform a full topology scan from the focus node.
@@ -110,10 +165,12 @@ class GraphAnalyzer:
             bridging_events=[],
             topology={},
         )
+        # Reset the per-scan first-detection latch (see on_first_detection).
+        self._detection_fired = False
 
         # === HOP 0: Query the focus node ===
         logger.info(f"Querying focus node {self.focus_node}...")
-        focus_details = self.api.get_linked_node_details(self.focus_node)
+        focus_details = self._fetch_details(self.focus_node, result)
         if focus_details is None:
             msg = f"Failed to query focus node {self.focus_node}"
             logger.error(msg)
@@ -157,7 +214,7 @@ class GraphAnalyzer:
             logger.info(f"Checking hop-1 node {hop1_node} ({hop1_info['callsign']})...")
 
             # Query this node's connections
-            hop1_details = self.api.get_linked_node_details(hop1_node)
+            hop1_details = self._fetch_details(hop1_node, result)
             if hop1_details is None:
                 logger.warning(f"API error querying node {hop1_node}")
                 continue
@@ -253,8 +310,7 @@ class GraphAnalyzer:
                         depth=1,
                         rule=f"Screen 2: non-bridge node {hop1_node} has connection to {hop2_node}",
                     )
-                    result.bridging_events.append(event)
-                    logger.warning(str(event))
+                    self._emit_event(result, event)
 
                     # Also investigate what's beyond this unauthorized node
                     self._walk_beyond(hop2_node, [self.focus_node, hop1_node, hop2_node],
@@ -277,7 +333,7 @@ class GraphAnalyzer:
 
         Any connection beyond the guest = problem (hop 3 via bridge).
         """
-        guest_details = self.api.get_linked_node_details(guest_node)
+        guest_details = self._fetch_details(guest_node, result)
         if guest_details is None:
             logger.warning(f"API error querying guest node {guest_node}")
             return
@@ -356,8 +412,7 @@ class GraphAnalyzer:
                 rule=(f"Screen 2: guest {guest_node} (via bridge {bridge_node}) "
                       f"has unauthorized connection to {hop3_node}"),
             )
-            result.bridging_events.append(event)
-            logger.warning(str(event))
+            self._emit_event(result, event)
 
             # Walk further to catalog the full extent of the problem
             self._walk_beyond(hop3_node, path, result, depth=4)
@@ -373,7 +428,7 @@ class GraphAnalyzer:
             logger.info(f"  Max depth {max_depth} reached, stopping walk.")
             return
 
-        details = self.api.get_linked_node_details(node_id)
+        details = self._fetch_details(node_id, result)
         if details is None or len(details) == 0:
             return
 

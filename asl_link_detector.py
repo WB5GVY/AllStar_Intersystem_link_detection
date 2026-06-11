@@ -19,6 +19,7 @@ import os
 import shutil
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,8 +29,8 @@ import yaml
 
 from asl_api import ASLApiClient
 from auto_disconnect import AutoDisconnector
-from bubble_analyzer import fetch_and_analyze
-from cross_checker import cross_check
+from bubble_analyzer import fetch_and_analyze, fetch_bubble_map
+from cross_checker import cross_check, analyze_structured_paths
 from graph_analyzer import GraphAnalyzer
 from notifier import Notifier, RecipientResolutionError
 from status_server import StatusCollector, start_status_server
@@ -132,7 +133,15 @@ def load_config(config_path: str) -> dict:
 
 HIDDEN_BUBBLE_DIR = Path(__file__).parent / "bubble_maps_hidden"
 EVENT_BUBBLE_DIR = Path(__file__).parent / "bubble_maps_events"
-BUBBLE_KEEP = 100  # Per-directory cap; oldest beyond this are pruned.
+# Per-directory cap; oldest beyond this are pruned. A single detection now
+# writes up to `max_shots` event images (immediate + burst), so this is sized
+# to retain on the order of dozens of distinct detections, not just one image
+# each. Raised from 100 when evidence-burst capture landed (2026-06-11).
+BUBBLE_KEEP = 300
+# _preserve_bubble can now run concurrently (synchronous shot 0 on the scan
+# thread vs. burst shots on the evidence-burst thread). Serialize its
+# copy+prune critical section so the glob/sort/unlink can't race a copy.
+_PRESERVE_LOCK = threading.Lock()
 
 RESTART_LOG = Path(__file__).parent / "last_restart_times.txt"
 PANIC_FILE = Path(__file__).parent / "PANIC_STOPPED"
@@ -207,7 +216,8 @@ def check_restart_loop(max_restarts: int, window_minutes: int) -> None:
 
 
 def _preserve_bubble(src_path: str, scan_timestamp: str,
-                     dest_dir: Path, suffix: str) -> Optional[Path]:
+                     dest_dir: Path, suffix: str,
+                     tag: str = "") -> Optional[Path]:
     """Copy a temp bubble map to a stable location, returning the new path.
 
     Bubble maps are normally written to $TMPDIR with random tempfile names
@@ -215,8 +225,11 @@ def _preserve_bubble(src_path: str, scan_timestamp: str,
     helper preserves the scan-time image so it can be inspected later and
     attached to outgoing alert emails.
 
-    Filename: <YYYY-MM-DD_HH-MM-SS><suffix>.jpg, sortable by time.
-    Directory is auto-pruned to BUBBLE_KEEP files (oldest first).
+    Filename: <YYYY-MM-DD_HH-MM-SS><suffix><tag>.jpg, sortable by time.
+    `tag` distinguishes multiple shots that share one scan timestamp (the
+    immediate + burst evidence shots of a single detection); the canonical
+    attach-to-email shot uses tag="" so its filename matches the historical
+    "<stamp>_event.jpg" form. Directory is auto-pruned to BUBBLE_KEEP files.
     """
     if not src_path:
         return None
@@ -225,28 +238,29 @@ def _preserve_bubble(src_path: str, scan_timestamp: str,
         logger.warning(f"Bubble image not found at {src}, cannot preserve")
         return None
     try:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        # ScanResult.timestamp is "%Y-%m-%dT%H:%M:%SZ" (UTC). Reformat to a
-        # filesystem-friendly, sortable name. Fall back to a wall-clock stamp
-        # if the format ever changes.
-        try:
-            dt = datetime.strptime(scan_timestamp, "%Y-%m-%dT%H:%M:%SZ")
-            stamp = dt.strftime("%Y-%m-%d_%H-%M-%S")
-        except ValueError:
-            stamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
-        dst = dest_dir / f"{stamp}{suffix}.jpg"
-        shutil.copy2(src, dst)
-        logger.info(f"Preserved bubble map to {dst}")
+        with _PRESERVE_LOCK:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            # ScanResult.timestamp is "%Y-%m-%dT%H:%M:%SZ" (UTC). Reformat to a
+            # filesystem-friendly, sortable name. Fall back to a wall-clock
+            # stamp if the format ever changes.
+            try:
+                dt = datetime.strptime(scan_timestamp, "%Y-%m-%dT%H:%M:%SZ")
+                stamp = dt.strftime("%Y-%m-%d_%H-%M-%S")
+            except ValueError:
+                stamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+            dst = dest_dir / f"{stamp}{suffix}{tag}.jpg"
+            shutil.copy2(src, dst)
+            logger.info(f"Preserved bubble map to {dst}")
 
-        existing = sorted(dest_dir.glob(f"*{suffix}.jpg"))
-        excess = len(existing) - BUBBLE_KEEP
-        if excess > 0:
-            for old in existing[:excess]:
-                try:
-                    old.unlink()
-                except OSError as e:
-                    logger.warning(f"Could not prune {old}: {e}")
-        return dst
+            existing = sorted(dest_dir.glob(f"*{suffix}*.jpg"))
+            excess = len(existing) - BUBBLE_KEEP
+            if excess > 0:
+                for old in existing[:excess]:
+                    try:
+                        old.unlink()
+                    except OSError as e:
+                        logger.warning(f"Could not prune {old}: {e}")
+            return dst
     except Exception as e:
         logger.error(f"Failed to preserve bubble map: {e}")
         return None
@@ -262,12 +276,123 @@ def preserve_event_bubble(src_path: str, scan_timestamp: str) -> Optional[Path]:
     return _preserve_bubble(src_path, scan_timestamp, EVENT_BUBBLE_DIR, "_event")
 
 
+class EvidenceCapturer:
+    """Captures bubble-map evidence the instant a violation is detected.
+
+    Background
+    ----------
+    The old pipeline fetched a single bubble map at the END of the topology
+    walk. On a busy network the walk can run minutes past the moment of
+    detection (depth 4-8 "drag-in"), and a transient offending link can
+    self-resolve in that window — yielding a courtesy-notice image that shows
+    no violation (the 2026-06-10 incident that motivated this).
+
+    Triggered by GraphAnalyzer.on_first_detection, which fires SYNCHRONOUSLY on
+    the scan thread the moment the first violation is recorded. Shot 0 (the
+    image attached to the courtesy notice) is therefore captured synchronously
+    too: it belongs unambiguously to the scan currently running, and is on disk
+    before run_scan reads it — no cross-thread handoff, no wait, no chance of a
+    later scan's email attaching an earlier scan's image (the failure mode the
+    first async draft had during 15-second top-of-hour polling). Only the
+    follow-up *burst* shots — purely retrospective decay evidence — run on a
+    background daemon thread, guarded so overlapping detections don't stack
+    concurrent bursts.
+
+    Cadence is config-driven (config.yaml -> evidence_capture):
+        enabled, immediate, burst_interval_s, burst_duration_s, max_shots,
+        shot_timeout_s
+    """
+
+    def __init__(self, focus_node: int, config: dict):
+        ec = (config or {}).get("evidence_capture", {}) or {}
+        self.focus_node = focus_node
+        self.enabled = bool(ec.get("enabled", True))
+        self.immediate = bool(ec.get("immediate", True))
+        self.burst_interval_s = float(ec.get("burst_interval_s", 45))
+        self.burst_duration_s = float(ec.get("burst_duration_s", 210))
+        self.max_shots = int(ec.get("max_shots", 5))
+        # Per-shot HTTP fetch timeout. Bounds how long the synchronous shot 0
+        # can stall the scan walk; keep well under poll_interval.
+        self.shot_timeout_s = int(ec.get("shot_timeout_s", 15))
+        self._lock = threading.Lock()
+        self._active = False
+        # Path of the immediate shot for the CURRENT scan only. Written and read
+        # on the scan thread (trigger() then run_scan), so no locking needed.
+        self._current_shot0: Optional[Path] = None
+
+    def begin_scan(self) -> None:
+        """Clear last scan's immediate-shot path before a new scan starts."""
+        self._current_shot0 = None
+
+    def trigger(self, scan_timestamp: str) -> None:
+        """Capture shot 0 synchronously, then kick off the async burst.
+
+        Called from the first-detection callback, mid-scan, on the scan thread.
+        Shot 0 is captured inline so it is guaranteed to be this scan's image;
+        the burst (follow-up shots) is launched on a daemon thread and is a
+        no-op if a prior burst is still running.
+        """
+        if not self.enabled:
+            self._current_shot0 = None
+            return
+        # Shot 0 — synchronous; the image attached to the courtesy notice.
+        if self.immediate:
+            self._current_shot0 = self._one_shot(scan_timestamp, tag="")
+        else:
+            self._current_shot0 = None
+        # Follow-up burst — background, idempotent while one is in flight.
+        if self.max_shots > 1:
+            with self._lock:
+                if self._active:
+                    return
+                self._active = True
+            threading.Thread(
+                target=self._run_burst, args=(scan_timestamp,),
+                name="evidence-burst", daemon=True,
+            ).start()
+
+    def _run_burst(self, scan_timestamp: str) -> None:
+        try:
+            start = time.monotonic()
+            shots = 1  # shot 0 was already captured synchronously by trigger()
+            while shots < self.max_shots:
+                if time.monotonic() - start >= self.burst_duration_s:
+                    break
+                time.sleep(self.burst_interval_s)
+                self._one_shot(scan_timestamp, tag=f"_t{shots}")
+                shots += 1
+        except Exception as e:
+            logger.error(f"Evidence-capture burst failed: {e}")
+        finally:
+            with self._lock:
+                self._active = False
+
+    def _one_shot(self, scan_timestamp: str, tag: str) -> Optional[Path]:
+        tmp = fetch_bubble_map(self.focus_node, timeout=self.shot_timeout_s)
+        if not tmp:
+            return None
+        try:
+            return _preserve_bubble(
+                tmp, scan_timestamp, EVENT_BUBBLE_DIR, "_event", tag=tag)
+        finally:
+            try:
+                Path(tmp).unlink()
+            except OSError:
+                pass
+
+    def last_shot0(self) -> Optional[Path]:
+        """The immediate shot for the scan that just ran (None if disabled or
+        capture failed — caller then falls back to the end-of-scan image)."""
+        return self._current_shot0
+
+
 def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
              disconnector: AutoDisconnector,
              focus_node: int, api_client=None,
              collector: StatusCollector = None,
              dry_run: bool = False,
-             enable_image_crosscheck: bool = True) -> bool:
+             enable_image_crosscheck: bool = True,
+             capturer: "EvidenceCapturer" = None) -> bool:
     """Run a single topology scan with optional image cross-check.
 
     Returns True if problems were detected.
@@ -276,6 +401,10 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
     logger.info("Starting topology scan...")
 
     # === Phase 1: API-based analysis ===
+    # Clear last scan's immediate-shot path; the analyzer's first-detection
+    # callback (if it fires this scan) repopulates it synchronously.
+    if capturer is not None:
+        capturer.begin_scan()
     result = analyzer.scan()
 
     if collector:
@@ -307,6 +436,34 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
         else:
             logger.warning("Could not fetch/analyze bubble map — cross-check skipped.")
 
+    # === Phase 2b: Structured hidden-path analysis (Item B, SHADOW MODE) ===
+    # Exact BFS over the reported edge union the scan already collected — the
+    # eventual replacement for the CV cross-check. Logged for soak-period
+    # comparison against the CV verdict; NOT yet an alerting source. Once the
+    # logs show it reliably agrees on true paths and rejects the CV's phantom
+    # hidden-path false positives, the CV heuristic can be retired.
+    try:
+        structured = analyze_structured_paths(result)
+        logger.info(structured.summary())
+        if crosscheck_result is not None:
+            cv_hidden = crosscheck_result.possible_hidden_path_bridging
+            if cv_hidden != structured.hidden_path:
+                logger.warning(
+                    "SHADOW DIVERGENCE: CV hidden_path=%s but structured "
+                    "hidden_path=%s (structured distance>=3 nodes: %s). If "
+                    "structured is correct, the CV verdict is a false %s.",
+                    cv_hidden, structured.hidden_path,
+                    structured.deep_nodes or "none",
+                    "positive" if cv_hidden else "negative",
+                )
+            else:
+                logger.info(
+                    "SHADOW AGREE: CV and structured both hidden_path=%s",
+                    structured.hidden_path,
+                )
+    except Exception as e:
+        logger.error("Structured-path shadow analysis failed: %s", e)
+
     # === Evaluate combined results ===
     has_problems = result.has_problems
     if crosscheck_result and crosscheck_result.possible_hidden_path_bridging:
@@ -328,12 +485,21 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
     # losing the image would defeat the purpose of a soak period for tuning.
     # Only the actual email/SSH side effects are gated by dry_run below.
     event_bubble = None
-    if (result.has_problems and crosscheck_result
-            and crosscheck_result.image_result):
-        event_bubble = preserve_event_bubble(
-            crosscheck_result.image_result.image_path,
-            result.timestamp,
-        )
+    if result.has_problems:
+        # Item A: prefer the immediate-on-detection shot, captured the instant
+        # the violation was seen (closes the detection→fetch gap that let a
+        # transient link vanish before the old end-of-scan fetch). The capturer
+        # already saved it synchronously as "<stamp>_event.jpg" during the scan.
+        if capturer is not None:
+            event_bubble = capturer.last_shot0()
+        # Fallback: immediate capture disabled or failed — preserve the
+        # end-of-scan cross-check image as before (better than no attachment).
+        if (event_bubble is None and crosscheck_result
+                and crosscheck_result.image_result):
+            event_bubble = preserve_event_bubble(
+                crosscheck_result.image_result.image_path,
+                result.timestamp,
+            )
     hidden_bubble = None
     if (crosscheck_result and crosscheck_result.possible_hidden_path_bridging
             and not result.has_problems and crosscheck_result.image_result):
@@ -496,6 +662,12 @@ def main():
     )
     disconnector = AutoDisconnector(config, api_client)
 
+    # Immediate-on-detection evidence capturer (Item A). Wired to the analyzer's
+    # first-detection callback so a bubble map is grabbed the instant a
+    # violation is seen, not minutes later at end-of-scan.
+    capturer = EvidenceCapturer(focus_node, config)
+    analyzer.on_first_detection = lambda res, c=capturer: c.trigger(res.timestamp)
+
     # Status server for Home Assistant integration
     collector = StatusCollector(db_path=str(Path(config.get("db_path", "notifications.db"))))
     collector.attach_disconnector(disconnector)
@@ -522,7 +694,8 @@ def main():
             try:
                 run_scan(analyzer, notifier, disconnector, focus_node,
                          api_client=api_client, collector=collector,
-                         dry_run=args.dry_run, enable_image_crosscheck=enable_image)
+                         dry_run=args.dry_run, enable_image_crosscheck=enable_image,
+                         capturer=capturer)
             except Exception as e:
                 logger.exception("run_scan crashed: %s", e)
                 notifier.report_error("Scan crashed (single-shot)", str(e), exc=e)
@@ -597,6 +770,12 @@ def main():
                         focus_node = new_focus_node
                         notifier = new_notifier
                         health_check_interval = new_health_interval
+                        # Rebuild the capturer against the (possibly changed)
+                        # focus_node and evidence_capture settings, and re-wire
+                        # it to the freshly-constructed analyzer.
+                        capturer = EvidenceCapturer(new_focus_node, new_config)
+                        analyzer.on_first_detection = (
+                            lambda res, c=capturer: c.trigger(res.timestamp))
                         if new_monitor_only != monitor_only:
                             if new_monitor_only:
                                 logger.warning(
@@ -620,7 +799,8 @@ def main():
                     run_scan(analyzer, notifier, disconnector, focus_node,
                              api_client=api_client, collector=collector,
                              dry_run=monitor_only,
-                             enable_image_crosscheck=enable_image)
+                             enable_image_crosscheck=enable_image,
+                             capturer=capturer)
                 except Exception as e:
                     logger.exception("run_scan crashed: %s", e)
                     try:

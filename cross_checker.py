@@ -17,12 +17,96 @@ Cross-check logic:
 """
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 
 from graph_analyzer import ScanResult
 from bubble_analyzer import BubbleAnalysisResult
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class StructuredPathResult:
+    """Exact topology distances computed from the structured edge union.
+
+    Item B (2026-06-11): replaces the bubble-map computer-vision hidden-path
+    heuristic with exact graph analysis over the bidirectional link union the
+    scan already collects (ScanResult.edges). The CV's distance was traced from
+    rendered pixels and produced off-by-one phantom distances in dense node
+    clusters (the 2026-06-02/05 false-positive hidden-path alerts); this is
+    computed from real reported edges, so those phantoms cannot occur.
+
+    Runs in SHADOW MODE — logged alongside the CV verdict for soak validation,
+    not yet an alerting source.
+    """
+    focus_node: int
+    node_count: int                 # reachable nodes in the union (incl. focus)
+    max_distance: int
+    distances: dict                 # node_id -> hops from focus
+    deep_nodes: list                # node_ids at distance >= 3 (real bridging)
+    hidden_path: bool               # any genuine node at distance >= 3
+    notes: list
+
+    def summary(self) -> str:
+        deep = ", ".join(str(n) for n in self.deep_nodes) or "none"
+        return (
+            f"Structured-Path (exact, from edge union): "
+            f"{self.node_count} reachable nodes, max distance "
+            f"{self.max_distance}, distance>=3 nodes: {deep}"
+        )
+
+
+def analyze_structured_paths(result: ScanResult) -> StructuredPathResult:
+    """Compute exact BFS distances from the focus over result.edges.
+
+    The edge union preserves cross-links that the directed scan tree discards,
+    so a node bridged in through a non-reporting hop (whose neighbors report it)
+    lands at its true distance — no image, no CV, no phantom edges.
+    """
+    focus = result.focus_node
+    adj: dict = {}
+    for e in result.edges:
+        if len(e) != 2:        # defensive: skip any malformed/self edge
+            continue
+        a, b = tuple(e)
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+
+    distances = {focus: 0}
+    q = deque([focus])
+    while q:
+        cur = q.popleft()
+        for nbr in adj.get(cur, ()):
+            if nbr not in distances:
+                distances[nbr] = distances[cur] + 1
+                q.append(nbr)
+
+    max_distance = max(distances.values()) if distances else 0
+    # Exclude the bridge nodes' own permitted second hop is already encoded in
+    # the topology rules; here we simply surface any node at distance >= 3,
+    # which under the focus/bridge model is always a real Screen-1 violation.
+    deep_nodes = sorted(n for n, d in distances.items() if d >= 3)
+
+    notes = []
+    api_max_depth = max(
+        (info.get("depth", 0) for info in result.topology.values()), default=0
+    )
+    if max_distance != api_max_depth:
+        notes.append(
+            f"structured max distance {max_distance} vs API tree depth "
+            f"{api_max_depth} (cross-links can legitimately differ)"
+        )
+
+    return StructuredPathResult(
+        focus_node=focus,
+        node_count=len(distances),
+        max_distance=max_distance,
+        distances=distances,
+        deep_nodes=deep_nodes,
+        hidden_path=bool(deep_nodes),
+        notes=notes,
+    )
 
 
 @dataclass
