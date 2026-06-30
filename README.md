@@ -2,6 +2,9 @@
 
 Automated detection and response system for unauthorized inter-system bridging on AllStarLink repeater networks.
 
+> **Status note (2026-06-30): the bubble-map image-analysis / "hidden-path" layer is known to produce false positives and has been disabled in the maintainer's deployment.**
+> Investigation of the data source showed the server-rendered bubble map is generated from the same registration data the AllStarLink stats API already exposes, so a bridge "visible only on the map" does not arise in practice — across the full production history, every hidden-path alert was a computer-vision misread of a benign (within-policy) topology. **The API-based topology detector — the primary detection path — is unaffected and remains reliable.** A revision that removes the image-analysis layer is in progress. If you are evaluating this project, rely on the API detector and treat the image/hidden-path code as deprecated.
+
 ## Background
 
 AllStarLink linkage between repeater systems is at the discretion of each system's Trustee (owner/operator). Different systems have different policies:
@@ -72,9 +75,9 @@ The system uses two independent detection methods:
 
 1. **API-based analysis** (`graph_analyzer.py`): Queries the AllStarLink Stats API for each node's connection list. Walks the graph outward from the focus node, applying detection rules at each hop. Provides exact node IDs, callsigns, and connection details.
 
-2. **Bubble map image analysis** (`bubble_analyzer.py`): Fetches the AllStarLink-generated network topology image (Graphviz bubble chart) and uses computer vision (OpenCV) to detect nodes, connections, and graph distances. Catches bridging through non-reporting nodes whose connection lists are not visible to the API.
+2. **Bubble map image analysis** (`bubble_analyzer.py`) — *deprecated, see Status note above*: Fetches the AllStarLink-generated network topology image (Graphviz bubble chart) and uses computer vision (OpenCV) to detect nodes, connections, and graph distances. Originally intended to catch bridging through non-reporting nodes. In practice the map carries no connectivity the API lacks, and the pixel-based edge tracer produced false positives; this layer is being removed.
 
-3. **Cross-checker** (`cross_checker.py`): Compares both results. If the image shows deeper topology than the API detected, it flags a possible hidden-path bridging event through non-reporting nodes.
+3. **Cross-checker** (`cross_checker.py`) — *deprecated, see Status note above*: Compares both results. If the image showed deeper topology than the API detected, it flagged a possible hidden-path event. This proved to be false-positive-only and its email alerts are disabled.
 
 ### Response Pipeline
 
