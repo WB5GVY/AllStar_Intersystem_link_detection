@@ -190,6 +190,21 @@ def analyze_bubble_map(image_path: str) -> Optional[BubbleAnalysisResult]:
     _assign_color(node_blobs, blue_centers, "BLUE", max_dist=150)
     _assign_color(node_blobs, pink_centers, "PINK", max_dist=150)
 
+    # === STEP 2b: Merge coincident (split) detections ===
+    # A single Graphviz ellipse occasionally fragments into 2+ contours (outline
+    # split by interior text/anti-aliasing), producing duplicate node blobs that
+    # inflate BFS distance and manufacture phantom distance>=3 "hidden path"
+    # false positives (root cause of the 2026-06-02/05 alerts). Merge on
+    # bounding-box OVERLAP (fragments of one ellipse overlap heavily; distinct
+    # Graphviz-placed nodes never overlap) — scale-free, and safe against hiding
+    # a real deep link (a center-distance threshold could transitively chain a
+    # fragment into a nearby distinct node; bbox overlap cannot).
+    pre_merge = len(node_blobs)
+    node_blobs = _merge_coincident_blobs(node_blobs)
+    if len(node_blobs) != pre_merge:
+        logger.info(f"Merged {pre_merge - len(node_blobs)} coincident "
+                    f"(split) node detection(s)")
+
     logger.info(f"Detected {len(node_blobs)} nodes "
                 f"(BLUE={sum(1 for n in node_blobs if n['color']=='BLUE')}, "
                 f"PINK={sum(1 for n in node_blobs if n['color']=='PINK')}, "
@@ -294,6 +309,98 @@ def _assign_color(node_blobs: list[dict], fill_centers: list[tuple[int, int]],
             })
 
 
+def _bbox_overlap_frac(a: tuple, b: tuple) -> float:
+    """Intersection area of two (x,y,w,h) boxes as a fraction of the SMALLER box.
+
+    ~1.0 when one box sits inside the other (text-contour inside an outline, or
+    two arcs of the same split ellipse); 0.0 for disjoint boxes (distinct nodes).
+    """
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    iy = max(0, min(ay + ah, by + bh) - max(ay, by))
+    inter = ix * iy
+    if inter == 0:
+        return 0.0
+    smaller = min(aw * ah, bw * bh)
+    return inter / smaller if smaller > 0 else 0.0
+
+
+def _merge_coincident_blobs(node_blobs: list[dict],
+                            min_overlap: float = 0.30) -> list[dict]:
+    """Collapse node detections that are fragments of ONE Graphviz ellipse.
+
+    A single ellipse occasionally fragments into 2+ contours (outline split by
+    interior text/anti-aliasing). Left separate, the duplicate + spurious
+    intra-bubble edge inflate BFS distance into phantom distance>=3 hidden-path
+    false positives.
+
+    Merge criterion is BOUNDING-BOX OVERLAP, not center distance: fragments of
+    the same ellipse have heavily overlapping bboxes, while DISTINCT nodes never
+    overlap (Graphviz lays them out with clear separation). This is scale-free
+    and — unlike a fixed center-distance threshold — cannot transitively chain a
+    split fragment into a nearby-but-distinct node (a false-negative vector that
+    would hide a real deep link). All member contours are retained on the
+    representative so connection detection still masks the whole ellipse.
+    """
+    n = len(node_blobs)
+    if n < 2:
+        return node_blobs
+
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _bbox_overlap_frac(node_blobs[i]["bbox"],
+                                  node_blobs[j]["bbox"]) >= min_overlap:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[rj] = ri
+
+    clusters: dict = {}
+    for i in range(n):
+        clusters.setdefault(find(i), []).append(i)
+
+    color_rank = {"BLUE": 3, "PINK": 2, "WHITE": 1}
+    merged = []
+    for members in clusters.values():
+        if len(members) == 1:
+            b = dict(node_blobs[members[0]])
+            c = b.get("contour")
+            b["contours"] = [c] if c is not None else []
+            merged.append(b)
+            continue
+        # Representative = largest-area member (most complete contour), but the
+        # color is the highest-priority across the whole cluster so a small BLUE
+        # focus fragment is never demoted to WHITE.
+        best = max(members, key=lambda k: node_blobs[k]["area"])
+        rep = dict(node_blobs[best])
+        boxes = [node_blobs[k]["bbox"] for k in members]
+        x0 = min(b[0] for b in boxes)
+        y0 = min(b[1] for b in boxes)
+        x1 = max(b[0] + b[2] for b in boxes)
+        y1 = max(b[1] + b[3] for b in boxes)
+        rep["bbox"] = (x0, y0, x1 - x0, y1 - y0)
+        rep["center"] = (x0 + (x1 - x0) // 2, y0 + (y1 - y0) // 2)
+        rep["area"] = max(node_blobs[k]["area"] for k in members)
+        rep["color"] = max((node_blobs[k]["color"] for k in members),
+                           key=lambda c: color_rank.get(c, 0))
+        # Retain EVERY member's contour so _find_connections masks the whole
+        # ellipse (otherwise dropped fragments' outline pixels leak into the
+        # arrow mask and can re-create spurious edges).
+        rep["contours"] = [node_blobs[k].get("contour") for k in members
+                           if node_blobs[k].get("contour") is not None]
+        rep["contour"] = rep["contours"][0] if rep["contours"] else None
+        merged.append(rep)
+    return merged
+
+
 def _find_connections(node_blobs: list[dict], dark_mask: np.ndarray,
                       img_shape: tuple, w_img: int, h_img: int) -> set[tuple[int, int]]:
     """Find connections between nodes by tracing arrow paths.
@@ -307,8 +414,17 @@ def _find_connections(node_blobs: list[dict], dark_mask: np.ndarray,
     # Remove node regions from dark mask to isolate arrows
     node_mask = np.zeros(img_shape, dtype=np.uint8)
     for n in node_blobs:
-        if n["contour"] is not None:
-            cv2.drawContours(node_mask, [n["contour"]], -1, 255, 25)
+        # Mask EVERY contour the blob carries. Merged (formerly-split) blobs
+        # keep all member contours in "contours" so the whole ellipse is masked
+        # out of the arrow layer; otherwise dropped fragment outlines leak in as
+        # spurious edge pixels. Fall back to the single "contour", then to a
+        # synthetic ellipse for contour-less (color-fill-only) blobs.
+        conts = n.get("contours")
+        if conts is None:
+            conts = [n["contour"]] if n.get("contour") is not None else []
+        if conts:
+            for c in conts:
+                cv2.drawContours(node_mask, [c], -1, 255, 25)
         else:
             cx, cy = n["center"]
             cv2.ellipse(node_mask, (cx, cy), (100, 50), 0, 0, 360, 255, -1)

@@ -91,23 +91,40 @@ class GraphAnalyzer:
 
     DEFAULT_STALE_THRESHOLD_MINUTES = 120
 
+    DEFAULT_MAX_DRAGGED_IN = 30  # cap on informational deep-walk cataloging
+
     def __init__(self, api_client: ASLApiClient, focus_node: int,
                  bridge_nodes: list[int],
                  allowlist: Optional[list[int]] = None,
-                 stale_threshold_minutes: float = DEFAULT_STALE_THRESHOLD_MINUTES):
+                 stale_threshold_minutes: float = DEFAULT_STALE_THRESHOLD_MINUTES,
+                 max_dragged_in_nodes: int = DEFAULT_MAX_DRAGGED_IN):
         self.api = api_client
         self.focus_node = focus_node
         self.bridge_nodes = set(bridge_nodes)
         self.allowlist = set(allowlist or [])
         self.stale_threshold_minutes = stale_threshold_minutes
+        # Cap on the depth>=4 "drag-in" catalog walk. The walk adds NO detection
+        # (the offender is already identified at depth 2-3) — it only logs the
+        # extent of the foreign mesh. On a huge event that walk fetched 264
+        # nodes (~13 min, each rate-limited), which delayed the end-of-scan image
+        # AND the auto-disconnect phase until long after the link self-resolved.
+        # Capping it keeps scans short so action stays timely.
+        self.max_dragged_in_nodes = max_dragged_in_nodes
         # Optional callback fired exactly once per scan, the instant the FIRST
         # bridging event is detected — used to trigger immediate bubble-map
-        # evidence capture before the (potentially minutes-long) deep drag-in
-        # walk finishes and before the offending link can self-resolve.
-        # Receives the in-progress ScanResult. Exceptions are swallowed so a
-        # capture failure can never abort a scan.
+        # evidence capture before the deep drag-in walk finishes and before the
+        # offending link can self-resolve. Receives the in-progress ScanResult.
+        # Exceptions are swallowed so a capture failure can never abort a scan.
         self.on_first_detection: Optional[Callable[["ScanResult"], None]] = None
+        # Optional callback fired (synchronously, on the scan thread) for EACH
+        # bridging event the instant it is recorded — used to attempt auto-
+        # disconnect AT DETECTION TIME rather than after the walk. Receives the
+        # BridgingEvent. Exceptions are swallowed so a disconnect failure can
+        # never abort a scan.
+        self.on_violation: Optional[Callable[["BridgingEvent"], None]] = None
         self._detection_fired = False
+        self._dragged_in_count = 0
+        self._cap_logged = False
 
     def _fetch_details(self, node_id: int, result: "ScanResult"):
         """Fetch a node's linked-node details AND record its numeric links into
@@ -148,6 +165,14 @@ class GraphAnalyzer:
                     cb(result)
                 except Exception as e:  # never let capture abort a scan
                     logger.error(f"on_first_detection callback failed: {e}")
+        # Per-event action hook (auto-disconnect at detection time). Fires for
+        # EVERY event, AFTER on_first_detection so the evidence image is captured
+        # before any disconnect changes the topology. Errors are swallowed.
+        if self.on_violation is not None:
+            try:
+                self.on_violation(event)
+            except Exception as e:  # never let a disconnect abort a scan
+                logger.error(f"on_violation callback failed: {e}")
 
     def scan(self) -> ScanResult:
         """Perform a full topology scan from the focus node.
@@ -165,8 +190,10 @@ class GraphAnalyzer:
             bridging_events=[],
             topology={},
         )
-        # Reset the per-scan first-detection latch (see on_first_detection).
+        # Reset per-scan latches/counters.
         self._detection_fired = False
+        self._dragged_in_count = 0
+        self._cap_logged = False
 
         # === HOP 0: Query the focus node ===
         logger.info(f"Querying focus node {self.focus_node}...")
@@ -427,6 +454,18 @@ class GraphAnalyzer:
         if depth > max_depth:
             logger.info(f"  Max depth {max_depth} reached, stopping walk.")
             return
+        # Global drag-in budget: this catalog walk creates no detection, so
+        # bound it so a huge foreign mesh can't stretch the scan (and thus the
+        # auto-disconnect/image) by many minutes. Logged once when first hit.
+        if self._dragged_in_count >= self.max_dragged_in_nodes:
+            if not self._cap_logged:
+                self._cap_logged = True
+                logger.info(
+                    f"  Drag-in catalog cap reached "
+                    f"({self.max_dragged_in_nodes} nodes) — not walking the full "
+                    f"extent (the mesh is larger). Detection is already complete; "
+                    f"this only bounds informational cataloging.")
+            return
 
         details = self._fetch_details(node_id, result)
         if details is None or len(details) == 0:
@@ -446,9 +485,13 @@ class GraphAnalyzer:
                 "client_type": "allstar",
                 "callsign": callsign, "location": location,
             }
+            self._dragged_in_count += 1
             logger.info(f"  {'  ' * depth}Depth {depth}: node {nid} ({callsign}) dragged in")
 
             self._walk_beyond(nid, path_so_far + [nid], result, depth + 1, max_depth)
+            # Stop cataloging sibling branches too once the budget is exhausted.
+            if self._dragged_in_count >= self.max_dragged_in_nodes:
+                break
 
     def _is_node_alive(self, node_id: int, api_info: dict) -> bool:
         """Check if a node is alive using DNS (primary) and regseconds (secondary).

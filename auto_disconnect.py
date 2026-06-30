@@ -49,7 +49,8 @@ class DisconnectResult:
     target_node: int
     success: bool
     action: str          # "disconnected", "skipped_reverify", "skipped_disabled",
-                         # "skipped_flagfile", "skipped_local_override", "ssh_failed"
+                         # "skipped_flagfile", "skipped_local_override",
+                         # "skipped_cooldown", "ssh_failed"
     message: str
 
 
@@ -57,6 +58,8 @@ class AutoDisconnector:
     """Manages auto-disconnect for nodes we admin."""
 
     DEFAULT_REVERIFY_DELAY = 15  # seconds
+    DEFAULT_COOLDOWN_SECONDS = 120  # min seconds between SUCCESSFUL disconnects
+                                    # of the same (managed, target) pair
 
     def __init__(self, config: dict, api_client: ASLApiClient):
         self.api = api_client
@@ -65,6 +68,14 @@ class AutoDisconnector:
         self.reverify_delay = config.get("auto_disconnect", {}).get(
             "reverify_delay_seconds", self.DEFAULT_REVERIFY_DELAY
         )
+        self.cooldown_seconds = config.get("auto_disconnect", {}).get(
+            "disconnect_cooldown_seconds", self.DEFAULT_COOLDOWN_SECONDS
+        )
+        # Per-(managed_node, target) last-attempt monotonic timestamps. Prevents
+        # an SSH storm now that disconnect fires at detection time on every scan
+        # (and that one scan can emit several events for the same target when the
+        # focus node is itself managed). Per-instance; resets on config reload.
+        self._last_attempt: dict[tuple[int, int], float] = {}
 
         # Load managed nodes from config
         for node_cfg in config.get("auto_disconnect", {}).get("nodes", []):
@@ -147,6 +158,31 @@ class AutoDisconnector:
                 managed_node=managed.node_id, target_node=target,
                 success=True, action="skipped_local_override", message=msg
             )
+
+        # === Cooldown: don't re-hit the same target too often ===
+        # Detection-time firing + short scans mean a persistent relinker could
+        # otherwise be disconnected every scan, and a focus-managed multi-guest
+        # node can emit several events for the SAME target in one scan. Recorded
+        # before the re-verify sleep so repeats skip the expensive path entirely.
+        key = (managed.node_id, target)
+        now = time.monotonic()
+        last = self._last_attempt.get(key)
+        if last is not None and (now - last) < self.cooldown_seconds:
+            msg = (f"Auto-disconnect for node {target} via {managed.node_id} "
+                   f"skipped — within {self.cooldown_seconds}s cooldown "
+                   f"({now - last:.0f}s since last successful disconnect).")
+            logger.info(msg)
+            return DisconnectResult(
+                managed_node=managed.node_id, target_node=target,
+                success=True, action="skipped_cooldown", message=msg
+            )
+        # NOTE: the cooldown is armed ONLY on a genuine disconnect (end of this
+        # method), never here. Recording before the outcome would let a failed
+        # SSH or a transient skipped_reverify burn the window and leave a real
+        # bridge up for the full cooldown (audit CRITICAL). Same-scan duplicate
+        # events for one target are still deduped: on_violation fires
+        # synchronously, so a successful first disconnect arms the cooldown
+        # before the next same-target event is processed.
 
         logger.info(
             f"Auto-disconnect candidate: node {target} via managed node "
@@ -265,7 +301,12 @@ class AutoDisconnector:
             f"AUTO-DISCONNECT: Disconnecting node {target} from "
             f"managed node {managed.node_id} ({managed.ssh_host})"
         )
-        return self._ssh_disconnect(managed, target)
+        result = self._ssh_disconnect(managed, target)
+        # Arm the cooldown ONLY on a real disconnect, so a failed/transient
+        # attempt retries on the next scan instead of being suppressed.
+        if result.action == "disconnected":
+            self._last_attempt[key] = time.monotonic()
+        return result
 
     def _ssh_disconnect(self, managed: ManagedNode, target: int) -> DisconnectResult:
         """SSH into the managed node and force-disconnect the target.

@@ -249,7 +249,13 @@ def _preserve_bubble(src_path: str, scan_timestamp: str,
             except ValueError:
                 stamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
             dst = dest_dir / f"{stamp}{suffix}{tag}.jpg"
-            shutil.copy2(src, dst)
+            # Atomic publish: copy to a temp name then os.replace into place, so
+            # a reader (notifier attaching a burst shot, best_shot selecting one)
+            # can never observe a half-written JPEG. os.replace is atomic on the
+            # same filesystem. The ".tmp" name is excluded from the prune glob.
+            tmp_dst = dest_dir / f"{stamp}{suffix}{tag}.jpg.tmp"
+            shutil.copy2(src, tmp_dst)
+            os.replace(tmp_dst, dst)
             logger.info(f"Preserved bubble map to {dst}")
 
             existing = sorted(dest_dir.glob(f"*{suffix}*.jpg"))
@@ -263,6 +269,12 @@ def _preserve_bubble(src_path: str, scan_timestamp: str,
             return dst
     except Exception as e:
         logger.error(f"Failed to preserve bubble map: {e}")
+        # Don't leave a half-written temp behind (it's excluded from the prune
+        # glob, so it would accumulate forever otherwise).
+        try:
+            (dest_dir / f"{stamp}{suffix}{tag}.jpg.tmp").unlink(missing_ok=True)
+        except (OSError, NameError):
+            pass
         return None
 
 
@@ -312,7 +324,10 @@ class EvidenceCapturer:
         self.burst_duration_s = float(ec.get("burst_duration_s", 210))
         self.max_shots = int(ec.get("max_shots", 5))
         # Per-shot HTTP fetch timeout. Bounds how long the synchronous shot 0
-        # can stall the scan walk; keep well under poll_interval.
+        # can stall the scan walk — kept at 15s so it never exceeds the 15s
+        # top-of-hour poll cadence. A slow render (e.g. a 277-node map ~60s)
+        # will time shot 0 out, but the burst-shot fallback (best_shot) then
+        # supplies a near-detection image, so shot 0 need not win that race.
         self.shot_timeout_s = int(ec.get("shot_timeout_s", 15))
         self._lock = threading.Lock()
         self._active = False
@@ -380,10 +395,77 @@ class EvidenceCapturer:
             except OSError:
                 pass
 
-    def last_shot0(self) -> Optional[Path]:
-        """The immediate shot for the scan that just ran (None if disabled or
-        capture failed — caller then falls back to the end-of-scan image)."""
-        return self._current_shot0
+    @staticmethod
+    def _burst_index(p: Path) -> int:
+        """Burst sequence N from a '<stamp>_event_t<N>.jpg' filename."""
+        try:
+            return int(p.stem.rsplit("_t", 1)[1])
+        except (IndexError, ValueError):
+            return 1 << 30
+
+    def best_shot(self, scan_timestamp: str) -> Optional[Path]:
+        """Earliest successfully-captured evidence shot for THIS scan, or None.
+
+        Prefers shot 0 (`<stamp>_event.jpg`); failing that, the earliest burst
+        shot (`<stamp>_event_t<N>.jpg`, smallest N) — i.e. the image captured
+        CLOSEST to detection time and therefore most likely to still show a
+        transient violation. Crucially this is NOT the end-of-scan image: on a
+        long scan (a big topology can take many minutes to walk) the offending
+        link often self-resolves before the walk finishes, so the end-of-scan
+        fetch shows nothing (the 2026-06-21 incident: shot 0 timed out on a slow
+        277-node render, and the old fallback attached the collapsed end-of-scan
+        map instead of the burst shots that captured the violation).
+
+        Resolved by DISK LOOKUP keyed on the scan's own timestamp, so it is
+        inherently per-scan and free of cross-thread / cross-scan races. Returns
+        None only if no evidence shot exists at all — caller then falls back to
+        the end-of-scan cross-check image as a last resort.
+        """
+        try:
+            dt = datetime.strptime(scan_timestamp, "%Y-%m-%dT%H:%M:%SZ")
+            stamp = dt.strftime("%Y-%m-%d_%H-%M-%S")
+        except ValueError:
+            return self._current_shot0  # best effort if timestamp format changes
+        shot0 = EVENT_BUBBLE_DIR / f"{stamp}_event.jpg"
+        if shot0.is_file():
+            return shot0
+        bursts = sorted(EVENT_BUBBLE_DIR.glob(f"{stamp}_event_t*.jpg"),
+                        key=self._burst_index)
+        return bursts[0] if bursts else None
+
+
+def _handle_detection_disconnect(event, disconnector: AutoDisconnector,
+                                 collector: "StatusCollector",
+                                 dry_run: bool) -> None:
+    """Attempt auto-disconnect for a freshly-detected bridging event.
+
+    Invoked from GraphAnalyzer.on_violation AT DETECTION time (synchronously, on
+    the scan thread) so a transient violator is acted on within the re-verify
+    window instead of after the full (now bounded) topology walk. ALL innocent-
+    protection lives inside disconnector.attempt_disconnect — managed-node
+    gating, the 15s re-verify delay, the still-connected / still-alive / still-
+    bridging-outside-the-system checks, and the fail-closed flag file — and is
+    unchanged by moving the trigger earlier. No-op in dry-run / monitor-only.
+    """
+    if dry_run:
+        logger.info("Auto-disconnect suppressed (monitor-only/dry-run) for "
+                    f"detected event: {event.path_description}")
+        return
+    try:
+        disc_result = disconnector.attempt_disconnect(event)
+    except Exception as e:
+        logger.error(f"Auto-disconnect attempt errored for "
+                     f"{event.path_description}: {e}")
+        return
+    if disc_result is not None:
+        logger.info(
+            f"Auto-disconnect result for node {disc_result.target_node}: "
+            f"{disc_result.action} — {disc_result.message}")
+        if collector:
+            try:
+                collector.update_disconnect(disc_result)
+            except Exception as e:
+                logger.error(f"collector.update_disconnect failed: {e}")
 
 
 def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
@@ -405,6 +487,14 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
     # callback (if it fires this scan) repopulates it synchronously.
     if capturer is not None:
         capturer.begin_scan()
+    # Wire auto-disconnect to fire AT detection time (during the scan, per event)
+    # rather than at end-of-scan, so a transient violator is acted on within the
+    # re-verify window instead of after a multi-minute walk. dry_run is captured
+    # here so monitor-only scans never disconnect. (Set each scan because dry_run
+    # can change via SIGHUP and the analyzer is rebuilt on reload.)
+    analyzer.on_violation = (
+        lambda ev: _handle_detection_disconnect(
+            ev, disconnector, collector, dry_run))
     result = analyzer.scan()
 
     if collector:
@@ -486,12 +576,11 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
     # Only the actual email/SSH side effects are gated by dry_run below.
     event_bubble = None
     if result.has_problems:
-        # Item A: prefer the immediate-on-detection shot, captured the instant
-        # the violation was seen (closes the detection→fetch gap that let a
-        # transient link vanish before the old end-of-scan fetch). The capturer
-        # already saved it synchronously as "<stamp>_event.jpg" during the scan.
+        # Item A: attach the evidence shot captured CLOSEST to detection time —
+        # shot 0, or (if it failed/timed out) the earliest burst shot. Never the
+        # stale end-of-scan image while a good near-detection shot exists.
         if capturer is not None:
-            event_bubble = capturer.last_shot0()
+            event_bubble = capturer.best_shot(result.timestamp)
         # Fallback: immediate capture disabled or failed — preserve the
         # end-of-scan cross-check image as before (better than no attachment).
         if (event_bubble is None and crosscheck_result
@@ -546,17 +635,14 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
         # (always — table state is meaningful even in monitor-only).
         collector.update_unusual_externals()
 
-    # === Phase 3: Auto-disconnect (after notification, not in dry-run) ===
-    if result.has_problems and not dry_run:
-        for event in result.bridging_events:
-            disc_result = disconnector.attempt_disconnect(event)
-            if disc_result is not None:
-                logger.info(
-                    f"Auto-disconnect result for node {disc_result.target_node}: "
-                    f"{disc_result.action} — {disc_result.message}"
-                )
-                if collector:
-                    collector.update_disconnect(disc_result)
+    # === Phase 3: Auto-disconnect ===
+    # MOVED to detection time (2026-06-21): auto-disconnect now fires from
+    # GraphAnalyzer.on_violation as each event is detected (see
+    # _handle_detection_disconnect), so a transient violator is acted on within
+    # the re-verify window rather than after the full walk. No end-of-scan
+    # disconnect pass remains. Note: this means a disconnect can now precede the
+    # violation email (sent above) by the scan duration — the violation and the
+    # disconnect result are both logged in real time; the email follows.
 
     return True
 
@@ -659,6 +745,7 @@ def main():
         bridge_nodes=bridge_nodes,
         allowlist=config.get("allowlist", []),
         stale_threshold_minutes=config.get("stale_threshold_minutes", 120),
+        max_dragged_in_nodes=config.get("max_dragged_in_nodes", 30),
     )
     disconnector = AutoDisconnector(config, api_client)
 
@@ -690,11 +777,15 @@ def main():
 
     try:
         if args.once or args.dry_run:
-            notifier.set_dry_run(args.dry_run or monitor_only)
+            # monitor_only MUST gate the disconnect side effect too, not just
+            # email — otherwise `--once` during a monitor-only soak would perform
+            # real SSH disconnects. (Audit CRITICAL, 2026-06-21.)
+            single_dry_run = args.dry_run or monitor_only
+            notifier.set_dry_run(single_dry_run)
             try:
                 run_scan(analyzer, notifier, disconnector, focus_node,
                          api_client=api_client, collector=collector,
-                         dry_run=args.dry_run, enable_image_crosscheck=enable_image,
+                         dry_run=single_dry_run, enable_image_crosscheck=enable_image,
                          capturer=capturer)
             except Exception as e:
                 logger.exception("run_scan crashed: %s", e)
@@ -746,6 +837,8 @@ def main():
                             allowlist=new_config.get("allowlist", []),
                             stale_threshold_minutes=new_config.get(
                                 "stale_threshold_minutes", 120),
+                            max_dragged_in_nodes=new_config.get(
+                                "max_dragged_in_nodes", 30),
                         )
                         new_notifier = Notifier(new_config)
                         new_monitor_only = new_config.get("monitor_only", False)
