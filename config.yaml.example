@@ -109,3 +109,18 @@ status_server:
   enabled: true
   port: 61211
   health_check_interval_seconds: 300  # SSH health + flag file checks (seconds)
+
+# Analytics: persist a per-scan observation time-series to a separate SQLite DB
+# for periodic health/usage reports (see analytics_report.py). Pure observation —
+# never affects detection. Roles default to: core = the focus hub only;
+# bridge = the bridge_nodes above (designated bridges); guest = everything else.
+# Optionally override the role sets with explicit node-id lists. Enabling or
+# disabling requires a daemon restart (role changes are picked up on SIGHUP).
+analytics:
+  enabled: false
+  db_path: analytics.db
+  system_name: ""            # your system name; appears in the report title (e.g. "ACME")
+  # Set the role buckets explicitly (recommended — they can differ from the
+  # detection bridge_nodes above; a node may be core yet ALSO act as a bridge):
+  # core_nodes: [HUB, MEMBER1, MEMBER2]   # focus hub + always-connected members
+  # bridge_nodes: [BRIDGE1, BRIDGE2]      # the designated bridge nodes

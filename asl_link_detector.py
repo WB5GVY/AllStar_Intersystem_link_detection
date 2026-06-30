@@ -30,6 +30,7 @@ import yaml
 from asl_api import ASLApiClient
 from auto_disconnect import AutoDisconnector
 from bubble_analyzer import fetch_and_analyze, fetch_bubble_map
+from analytics_db import init_db, Recorder, build_present_from_topology
 from cross_checker import cross_check, analyze_structured_paths
 from graph_analyzer import GraphAnalyzer
 from notifier import Notifier, RecipientResolutionError
@@ -468,13 +469,74 @@ def _handle_detection_disconnect(event, disconnector: AutoDisconnector,
                 logger.error(f"collector.update_disconnect failed: {e}")
 
 
+def _analytics_roles(config: dict) -> dict:
+    """Derive the analytics role sets from config.
+
+    core   = the focus hub only (analytics.core_nodes overrides).
+    bridge = the configured bridge_nodes — the designated bridges that legitimately
+             come and go (analytics.bridge_nodes overrides).
+    guest  = everything else.
+    NB: this is distinct from auto_disconnect's "managed" set (SSH-controllable
+    nodes), which happens to include two bridges but is unrelated to topology role.
+    """
+    acfg = config.get("analytics") or {}
+    if not isinstance(acfg, dict):     # present-but-malformed (e.g. `analytics: yes`)
+        acfg = {}
+    focus = config["focus_node"]
+    # core defaults to the focus hub; bridge defaults to the configured
+    # bridge_nodes; guest = everything else. For this deployment both sets are
+    # set explicitly via analytics.core_nodes / analytics.bridge_nodes (config.yaml),
+    # because a node can be core yet also serve as a bridge.
+    core = set(acfg.get("core_nodes") or {focus})
+    bridges = set(acfg.get("bridge_nodes") or config.get("bridge_nodes", []))
+    return {"core": core, "bridges": bridges}
+
+
+def _build_analytics(config: dict):
+    """Open the analytics DB and build a recorder + role sets, or None if disabled
+    or on any error (analytics must NEVER block the monitor from starting). ALL
+    config access is inside the try — a present-but-empty/malformed `analytics:`
+    key must not crash startup."""
+    try:
+        acfg = config.get("analytics") or {}
+        if not isinstance(acfg, dict) or not acfg.get("enabled", False):
+            return None
+        # Anchor a relative db_path to this file's directory (matches the
+        # bubble_maps_* dirs) so it is cwd-independent under launchd/systemd.
+        db_path = Path(acfg.get("db_path", "analytics.db"))
+        if not db_path.is_absolute():
+            db_path = Path(__file__).parent / db_path
+        roles = _analytics_roles(config)
+        conn = init_db(db_path)
+        logger.info("Analytics recording: ENABLED (db=%s, core=%s, bridges=%s)",
+                    db_path, sorted(roles["core"]), sorted(roles["bridges"]))
+        return {"recorder": Recorder(conn), **roles}
+    except Exception as e:
+        logger.error("Analytics init failed (recording disabled this run): %s", e)
+        return None
+
+
+def _record_analytics(analytics, result, focus_node: int) -> None:
+    """Record this scan's present-set into the analytics DB. Fully fail-safe:
+    any error is logged and swallowed so analytics can never break a scan."""
+    if not analytics:
+        return
+    try:
+        present = build_present_from_topology(
+            result.topology, focus_node, analytics["core"], analytics["bridges"])
+        analytics["recorder"].reconcile_scan(present, ts=result.timestamp)
+    except Exception as e:
+        logger.error("Analytics recording failed (non-fatal): %s", e)
+
+
 def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
              disconnector: AutoDisconnector,
              focus_node: int, api_client=None,
              collector: StatusCollector = None,
              dry_run: bool = False,
              enable_image_crosscheck: bool = True,
-             capturer: "EvidenceCapturer" = None) -> bool:
+             capturer: "EvidenceCapturer" = None,
+             analytics=None) -> bool:
     """Run a single topology scan with optional image cross-check.
 
     Returns True if problems were detected.
@@ -504,6 +566,11 @@ def run_scan(analyzer: GraphAnalyzer, notifier: Notifier,
 
     total_nodes = len(result.topology)
     logger.info(f"API scan complete: {total_nodes} nodes in topology")
+
+    # === Analytics: record this scan's present-set (fail-safe; never blocks) ===
+    # Runs in every mode (incl. monitor-only/dry-run) — it is pure observation
+    # with no external side effects. Errors are logged and swallowed inside.
+    _record_analytics(analytics, result, focus_node)
 
     if result.errors:
         for err in result.errors:
@@ -775,6 +842,10 @@ def main():
     else:
         logger.info("Bubble map image cross-check: DISABLED")
 
+    # Analytics observation recorder (separate analytics.db; pure observation,
+    # never affects detection). None if disabled or on any init error.
+    analytics = _build_analytics(config)
+
     try:
         if args.once or args.dry_run:
             # monitor_only MUST gate the disconnect side effect too, not just
@@ -786,7 +857,7 @@ def main():
                 run_scan(analyzer, notifier, disconnector, focus_node,
                          api_client=api_client, collector=collector,
                          dry_run=single_dry_run, enable_image_crosscheck=enable_image,
-                         capturer=capturer)
+                         capturer=capturer, analytics=analytics)
             except Exception as e:
                 logger.exception("run_scan crashed: %s", e)
                 notifier.report_error("Scan crashed (single-shot)", str(e), exc=e)
@@ -869,6 +940,14 @@ def main():
                         capturer = EvidenceCapturer(new_focus_node, new_config)
                         analyzer.on_first_detection = (
                             lambda res, c=capturer: c.trigger(res.timestamp))
+                        # Refresh analytics role sets from the new config (the DB
+                        # connection persists; enabling/disabling analytics needs
+                        # a restart). Fail-safe — never breaks the reload.
+                        if analytics:
+                            try:
+                                analytics.update(_analytics_roles(new_config))
+                            except Exception as e:
+                                logger.error("Analytics role refresh failed: %s", e)
                         if new_monitor_only != monitor_only:
                             if new_monitor_only:
                                 logger.warning(
@@ -893,7 +972,7 @@ def main():
                              api_client=api_client, collector=collector,
                              dry_run=monitor_only,
                              enable_image_crosscheck=enable_image,
-                             capturer=capturer)
+                             capturer=capturer, analytics=analytics)
                 except Exception as e:
                     logger.exception("run_scan crashed: %s", e)
                     try:
