@@ -8,6 +8,7 @@ offender_email_draft.txt
 # Session handoff / analysis artifacts (local-only; may contain real identifiers)
 Executive_Summary*.md
 Feedback_*.md
+Analytics_Design*.md
 Ignore-Not_for_Claude/
 
 # Hotspot test harness and captures (contain real callsigns/node numbers)
