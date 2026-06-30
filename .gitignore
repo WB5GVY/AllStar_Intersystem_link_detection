@@ -61,6 +61,9 @@ proposed_HA_integration.md
 # Runtime data
 notifications.db
 notifications.db-journal
+analytics.db
+analytics.db-wal
+analytics.db-shm
 
 # Log files
 *.log
