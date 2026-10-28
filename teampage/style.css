@@ -1,0 +1,109 @@
+/* Repeater node status page — no framework, no CDN. Tokens on :root, dark via prefers-color-scheme. */
+:root {
+  --bg: #f6f7f9;
+  --card: #ffffff;
+  --text: #1b1f24;
+  --muted: #5c6670;
+  --line: #d8dde3;
+  --accent: #0b6fb8;
+  --ok: #1e8e3e;
+  --bad: #c62828;
+  --mark: #fff176;
+  --mark-text: #1b1f24;
+  --amber: #f9a825;
+  --amber-text: #1b1f24;
+  --red: #c62828;
+  --red-text: #ffffff;
+  --wait: #90a4ae;
+  --wait-text: #1b1f24;
+  --radius: 10px;
+  --gap: 16px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111418;
+    --card: #1b2026;
+    --text: #e6e9ec;
+    --muted: #9aa4ad;
+    --line: #2d343c;
+    --accent: #6cb6ff;
+    --ok: #4caf50;
+    --bad: #ef5350;
+    --mark: #8d6e00;
+    --mark-text: #ffffff;
+    --amber: #b8860b;
+    --amber-text: #ffffff;
+    --wait: #546e7a;
+    --wait-text: #ffffff;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #111418; --card: #1b2026; --text: #e6e9ec; --muted: #9aa4ad; --line: #2d343c; --accent: #6cb6ff;
+  --ok: #4caf50; --bad: #ef5350; --mark: #8d6e00; --mark-text: #ffffff; --amber: #b8860b; --amber-text: #ffffff;
+  --wait: #546e7a; --wait-text: #ffffff;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  padding: 0 16px 32px;
+}
+a { color: var(--accent); }
+h1 { font-size: 1.35rem; margin: 18px 0 8px; }
+h2 { font-size: 1.1rem; margin: 26px 0 10px; }
+h2 .icon { margin-right: 6px; color: var(--muted); }
+.top { max-width: 1200px; margin: 0 auto; }
+main, .foot { max-width: 1200px; margin: 0 auto; }
+
+.banner {
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  font-weight: 600;
+  background: var(--wait); color: var(--wait-text);
+}
+.banner-ok { background: var(--ok); color: #fff; }
+.banner-amber { background: var(--amber); color: var(--amber-text); }
+.banner-red { background: var(--red); color: var(--red-text); }
+.banner-wait { background: var(--wait); color: var(--wait-text); }
+.banner small { font-weight: 400; opacity: .9; display: block; margin-top: 2px; }
+
+.summary { margin: 12px 0 0; color: var(--muted); }
+.summary b { color: var(--text); }
+
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); }
+table.status { border-collapse: collapse; width: 100%; min-width: 720px; }
+table.status th, table.status td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; white-space: nowrap; }
+table.status th { color: var(--muted); font-weight: 600; font-size: .9rem; }
+table.status tr:last-child td { border-bottom: 0; }
+table.status td.desc { white-space: normal; min-width: 180px; }
+.dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--ok); }
+.dot.bad { background: var(--bad); }
+.dot.unk { background: var(--wait); }
+.mark { background: var(--mark); color: var(--mark-text); padding: 0 4px; border-radius: 3px; }
+.small { font-size: .85em; color: var(--muted); }
+.legend { color: var(--muted); font-size: .9rem; margin: 8px 2px 0; }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: var(--gap); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; }
+.card h3 { margin: 0 0 8px; font-size: 1rem; }
+.card h3 .num { color: var(--accent); margin-right: 6px; }
+.card h3 .call { font-weight: 700; margin-right: 6px; }
+.card h3 .desc { font-weight: 500; color: var(--muted); font-size: .92em; }
+.card table { border-collapse: collapse; width: 100%; }
+.card td { padding: 5px 6px; border-top: 1px solid var(--line); vertical-align: top; }
+.card tr:first-child td { border-top: 0; }
+.card td.k { color: var(--muted); width: 34%; white-space: nowrap; }
+.card td.v { word-break: break-word; }
+.card .links { line-height: 1.6; }
+.card .links span { display: inline-block; border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; margin: 0 4px 3px 0; font-size: .85em; }
+.card .links span.c { border-style: dashed; color: var(--muted); }
+
+.foot { color: var(--muted); font-size: .85rem; margin-top: 28px; }
+@media (max-width: 480px) {
+  body { padding: 0 16px 24px; }
+  .cards { grid-template-columns: 1fr; }
+  table.status { min-width: 640px; }
+}

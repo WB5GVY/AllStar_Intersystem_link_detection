@@ -1,0 +1,117 @@
+# Credentials and runtime config
+config.yaml
+secrets.yaml
+
+# Live offender email template
+offender_email_draft.txt
+
+# Session handoff / analysis artifacts (local-only; may contain real identifiers)
+Executive_Summary*.md
+Feedback_*.md
+Analytics_Design*.md
+Ignore-Not_for_Claude/
+
+# Hotspot test harness and captures (local only)
+hotspot_test/
+hotspot_test_capture.sh
+
+# Operational rules summary (real recipient/node identifiers; local-only)
+Intervention_and_Email_Rules.md
+
+# Perplexity research transcripts (local-only)
+perplexity-research/
+.perplexity-research/
+
+# HA dashboard / Lovelace YAML example (local-only; references real LAN host)
+HA_Lovelace_Card.md
+
+# Development docs
+ASL_LinkDetection_Journal.md
+ASL_LinkDetection_Plan.md
+SESSION_STATE.md
+node_*_changes*.md
+node_*_already_in_this_mode.md
+HamVoIP_Pi4_Research.md
+Toggle_Control_Research.md
+
+# Node audit data
+node_*_audit/
+
+# Proposed changes docs
+proposed_*_changes/
+
+# Audit reports
+*_Audit_Report*.md
+
+# Setup/migration docs (local only)
+SETUP.md
+
+# WebSocket reference doc (local only)
+Listener_WebSocket_Reference.md
+
+# Cloud node integration doc (local only)
+Cloud_Node_Requirements_for_Monitoring.md
+
+# HA integration proposal (local only)
+proposed_HA_integration.md
+
+# launchd plist (local only)
+*.plist
+
+# Runtime data
+notifications.db
+notifications.db-journal
+analytics.db
+analytics.db-wal
+analytics.db-shm
+analytics_notifications.db
+analytics_notifications.db-journal
+
+# Log files
+*.log
+*.log.*
+
+# Bubble map images (fetched at runtime)
+*.jpg
+*.jpeg
+*.png
+
+# Backup files (timestamped or descriptive .bak suffixes)
+*.bak
+*.bak.*
+.git.bak.*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# macOS
+.DS_Store
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Virtual environments
+venv/
+.venv/
+env/
+last_restart_times.txt
+PANIC_STOPPED
+
+# Local bubble-map renderer output + QRZ name cache (bubble_map_gen)
+bubble_maps_local/
+
+# pre-kick revert patches written by restart_verify_*.sh
+scripts/*.patch
+
+# team status page feed (public_export.py): rendered status.json + temp files
+public_export/

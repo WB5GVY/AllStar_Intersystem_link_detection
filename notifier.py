@@ -1,0 +1,3281 @@
+"""Notification system with rate limiting, quiet hours, and a single
+fail-safe email-dispatch chokepoint.
+
+Design (2026-05-14 chokepoint refactor):
+    Every outbound email in this module MUST go through `Notifier._dispatch_email`.
+    No other function in this file is permitted to call `smtplib.SMTP.sendmail`.
+    The chokepoint enforces three cross-cutting invariants:
+
+      (A) Recipient scoping by category. Only VIOLATION_SYSADMIN and
+          OFFENDER_COURTESY may reach external recipients (operators
+          beyond the internal_recipients list). HIDDEN_PATH_ANOMALY,
+          OPERATOR_AWARENESS, TEST, ERROR_REPORT, and ANALYTICS are
+          stripped to internal_recipients only, regardless of what the
+          caller passes.
+
+      (B) Hard 6-hour per-external-recipient cap. Independent of any other
+          rate limit. Enforced from rows in the `external_recipient_sends`
+          table.
+
+      (C) monitor_only / dry-run gate. Even if a future caller forgets to
+          check, the chokepoint refuses to send when self.dry_run is True.
+
+    Pre-write before send: every outbound email is recorded as a 'pending'
+    row in the appropriate counter table BEFORE smtplib is invoked, then
+    transitioned to 'sent' or 'failed'. This makes the launchd
+    restart-loop scenario idempotent — orphan 'pending' rows older than
+    five minutes at startup are upgraded to 'sent' (worst-case assumes the
+    send went out and the crash was after).
+
+Anyone editing this file: do not add another smtplib callsite. If you
+need a new email path, add an EmailCategory enum entry, update the
+category policy table in `_dispatch_email`, and route through it.
+"""
+
+import enum
+import html
+import json
+import logging
+import os
+import re
+import smtplib
+import sqlite3
+import time
+from datetime import datetime, timedelta, timezone
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
+from typing import Optional
+from zoneinfo import ZoneInfo
+
+from analytics_db import prior_offense_episodes
+from graph_analyzer import BridgingEvent, ScanResult, event_has_monitor_link
+from qrz_lookup import QRZLookup
+
+logger = logging.getLogger(__name__)
+
+DB_FILE = "notifications.db"
+
+# Per the 2026-05-14 audit (C6), an empty/whitespace-only name must NOT be
+# classified as "unusual" — it is a missing-data condition that must not
+# trigger an alert.
+CALLSIGN_LIKE = re.compile(r'^[A-Z]{1,2}\d[A-Z]{1,4}[A-Za-z0-9]*$')
+
+
+def is_unusual_external_name(name: str) -> bool:
+    """True if `name` is a non-AllStar external peer name that does not match
+    either an amateur radio callsign or the source-verified EchoLink-NNNNNN
+    format. Empty/whitespace names return False (missing-data condition)."""
+    if name is None:
+        return False
+    name = name.strip()
+    if not name:
+        return False
+    if name.startswith("EchoLink-"):
+        return False
+    return not CALLSIGN_LIKE.fullmatch(name)
+
+
+class EmailCategory(enum.Enum):
+    """Routing class for outbound emails. Determines recipient scope,
+    quiet-hours bypass, and which counter table records the send."""
+    VIOLATION_SYSADMIN  = "violation_sysadmin"   # path #1 — full recipients
+    OFFENDER_COURTESY   = "offender_courtesy"    # path #2 — offender + BCC full
+    HIDDEN_PATH_ANOMALY = "hidden_path_anomaly"  # path #3 — Bennett only
+    OPERATOR_AWARENESS  = "operator_awareness"   # path #4 — Bennett only (reclassified 2026-05-14)
+    TEST                = "test"                 # path #5 — Bennett only
+    ERROR_REPORT        = "error_report"         # new path — Bennett only
+    ANALYTICS           = "analytics"            # periodic health digest — Bennett only
+    REPEAT_OFFENDER     = "repeat_offender"      # watch-mode escalation — full recipients
+    WATCHDOG_ACTION     = "watchdog_action"      # link-state watchdog — Bennett only
+    VANTAGE_TRUST       = "vantage_trust"        # vantage-health gating — Bennett only
+    LISTENER_NOTICE     = "listener_notice"      # phase 2 listener presence — Bennett only
+    DARK_GUEST_NOTICE   = "dark_guest_notice"    # step 2b: dark guest with foreign entries — trustees
+    DARK_GUEST_ACTION   = "dark_guest_action"    # step 2b: dark guest keyed -> cut attempt — trustees
+
+
+# Per-category policy. Centralized so the chokepoint enforces it uniformly.
+# Anyone adding a new category MUST add an entry here.
+#
+# bypass_dry_run is True for ERROR_REPORT and ANALYTICS — monitor_only is
+# intended to suppress externally-visible side effects (emails to other
+# operators, SSH disconnects), but both of these go to Bennett only by
+# category-A invariant, so suppressing them defeats the goal. For ERROR_REPORT:
+# during monitor_only Bennett still wants to know if reload failed or the
+# daemon crashed (audit S-4, 2026-05-15 self-review). For ANALYTICS: the
+# periodic digest is generated by a SEPARATE standalone process
+# (analytics_report.py via launchd/cron) that constructs its own Notifier and
+# never calls set_dry_run(False); a fresh Notifier defaults to dry_run=True
+# (fail-closed), so without bypass_dry_run the digest would never send. It is
+# read-only and Bennett-only, so this is safe — monitor_only must not silence
+# Bennett's own health summary.
+# defer_quiet (2026-10-12, Bennett after the 10-11 00:33 alert was dropped):
+# a category that respects quiet hours is QUEUED during them and delivered
+# when they end (flush_deferred, called every scan cycle) instead of being
+# dropped. Categories without the flag keep the old drop behaviour
+# (VANTAGE_TRUST has its own pending-retry in vantage_trust.py; LISTENER /
+# OPERATOR notices are low value and have their own cadence).
+CATEGORY_POLICY = {
+    EmailCategory.VIOLATION_SYSADMIN:  dict(allow_external=True,  bypass_quiet=False, bypass_dry_run=False, defer_quiet=True),
+    EmailCategory.OFFENDER_COURTESY:   dict(allow_external=True,  bypass_quiet=True,  bypass_dry_run=False),
+    EmailCategory.HIDDEN_PATH_ANOMALY: dict(allow_external=False, bypass_quiet=False, bypass_dry_run=False, defer_quiet=True),
+    EmailCategory.OPERATOR_AWARENESS:  dict(allow_external=False, bypass_quiet=False, bypass_dry_run=False),
+    EmailCategory.TEST:                dict(allow_external=False, bypass_quiet=True,  bypass_dry_run=False),
+    EmailCategory.ERROR_REPORT:        dict(allow_external=False, bypass_quiet=True,  bypass_dry_run=True),
+    EmailCategory.ANALYTICS:           dict(allow_external=False, bypass_quiet=True,  bypass_dry_run=True),
+    # bypass_quiet=True by explicit 2026-07-02 decision: a repeat offender
+    # (>= strike-threshold VERIFIED re-offenses after auto-disconnects, all
+    # within one watch window) is persistent/intentional — exactly the case
+    # worth alerting on at night. bypass_external_cap=True because the
+    # escalation follows the initial VIOLATION_SYSADMIN email within the same
+    # watch window, so the trustees' 6h per-address cap would otherwise
+    # suppress precisely the more-urgent second email (audit 2026-07-03, S3).
+    # Volume is inherently bounded: at most ONE escalation per offender per
+    # watch window (LinkWatcher `escalated` latch), and the send still writes
+    # the cap row, extending the trustees' cooldown for ordinary categories.
+    EmailCategory.REPEAT_OFFENDER:     dict(allow_external=True,  bypass_quiet=True,  bypass_dry_run=False,
+                                            bypass_external_cap=True),
+    # Link-state watchdog (2026-07-21): autonomous enforcement on sustained
+    # excess link-state advertisement. Bennett-only while the feature is in
+    # its debugging phase (his explicit position 2026-07-21) — trustees see
+    # nothing from this path until it earns promotion. bypass_dry_run=True
+    # (audit S3): a monitor-only soak is exactly when Bennett most needs to
+    # SEE what the watchdog would have done; the category is internal-only,
+    # so nothing externally visible escapes monitor_only.
+    # WATCHDOG_ACTION's subject carries the changing foreign count, so its
+    # caller passes an explicit coalesce key (action|target) — see
+    # send_watchdog_alert (audit R4).
+    EmailCategory.WATCHDOG_ACTION:     dict(allow_external=False, bypass_quiet=False, bypass_dry_run=True, defer_quiet=True),
+    # Vantage-trust gating (2026-08-22): transition notices when the external
+    # vantage-health monitor reports the vantage's own link state suspect
+    # (the stale link-state ghost class) or its status feed goes
+    # missing/stale. Same posture as WATCHDOG_ACTION: internal-only, respects
+    # quiet hours (the API detection layer keeps enforcing regardless, so
+    # overnight delivery is not critical — a refused send stays pending in
+    # vantage_trust.py and retries after quiet hours end), bypass_dry_run=True
+    # so monitor-only soaks still show the transition. Volume bounded by the
+    # pending-notice + cooldown state machine (vantage_trust.py).
+    EmailCategory.VANTAGE_TRUST:       dict(allow_external=False, bypass_quiet=False, bypass_dry_run=True),
+    # Phase 2 listener notice (2026-09-07): while a permitted all-monitor
+    # guest with outside branches is present, an INFREQUENT internal note
+    # that the system's link counts (Supermon, *70, RPT_NUMLINKS) include
+    # mesh entries reachable only through that guest's monitor links, and
+    # that the watchdog runs on a frozen allowance. Same posture as
+    # VANTAGE_TRUST; cadence bounded by listener_notice.py.
+    EmailCategory.LISTENER_NOTICE:     dict(allow_external=False, bypass_quiet=False, bypass_dry_run=True),
+    # Step 2b (2026-09-07, Bennett): a dark guest carrying other systems is
+    # given the benefit of the doubt until it keys; the trustees get a
+    # low-rate notice (cadence bounded by dark_guest.py, >= 24 h per node)
+    # and the action record when it keys. External-capable like a violation.
+    # Bennett 2026-09-08 02:0x: INTERNAL-ONLY initially (he reviews the first
+    # real ones before trustees see them). Flip allow_external to True +
+    # restart to widen the audience.
+    EmailCategory.DARK_GUEST_NOTICE:   dict(allow_external=False, bypass_quiet=False, bypass_dry_run=False, defer_quiet=True),
+    EmailCategory.DARK_GUEST_ACTION:   dict(allow_external=False, bypass_quiet=False, bypass_dry_run=False, defer_quiet=True),
+}
+
+# Deferred (quiet-hours) delivery limits.
+DEFERRED_MAX_AGE_HOURS = 24      # older than this at flush time -> 'expired', not sent
+DEFERRED_MAX_ATTEMPTS = 6        # transient SMTP failures before a queued row is 'failed'
+DEFERRED_MIN_SPACING_S = 120     # one deferred delivery per this many seconds (audit C2)
+DEFERRED_RETRY_SPACING_S = 600   # back-off after a transient SMTP failure (audit R1): 6 x 10 min = 1 h
+DEFERRED_SCAN_LIMIT = 10         # rows examined per flush so a refused row cannot block newer ones (R3)
+DEFERRED_PRUNE_INTERVAL_S = 3600 # retention sweep cadence
+
+
+# One plain address: no display name, no list separators, no header breaks,
+# exactly one "@" with a dotted domain. Deliberately conservative — a QRZ
+# record we cannot parse cleanly gets no email rather than a guessed one.
+_PLAIN_ADDRESS_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+def is_plain_email_address(addr) -> bool:
+    """True only for a single, syntactically plain address safe to place in
+    To: and the SMTP envelope (2026-09-10 audit S2)."""
+    if not isinstance(addr, str):
+        return False
+    a = addr.strip()
+    if len(a) > 254 or any(c in a for c in "\r\n,;<> \t"):
+        return False
+    return bool(_PLAIN_ADDRESS_RE.match(a))
+
+
+def apply_absolute_recipient_cap(tracker, envelope_recipients: list[str],
+                                 max_per_window: int, window_hours: float,
+                                 category_value: str):
+    """(D) ABSOLUTE per-recipient volume fail-safe (2026-07-03, Bennett).
+
+    Returns (allowed_recipients, notice_needed). An address with
+    >= max_per_window sends in the trailing window is dropped from the
+    envelope; an address about to receive its FINAL allowed email (count ==
+    max-1) sets notice_needed so the caller appends a rate-limit notice to
+    the body. No category bypasses this — it is the outermost guard against
+    a pathological email storm (bug loop, relink war, tracker corruption).
+    Fail-closed: recipient_send_count returns inf on DB error, so a broken
+    tracker suppresses rather than storms."""
+    allowed: list[str] = []
+    notice_needed = False
+    for addr in envelope_recipients:
+        n = tracker.recipient_send_count(addr, window_hours)
+        if n >= max_per_window:
+            logger.warning(
+                "ABSOLUTE recipient cap: suppressing %s (%s sends in the "
+                "last %gh >= %d) category=%s", addr, n, window_hours,
+                max_per_window, category_value)
+            continue
+        if n >= max_per_window - 1:
+            notice_needed = True
+        allowed.append(addr)
+    return allowed, notice_needed
+
+
+RATE_LIMIT_NOTICE_TEXT = (
+    "\n\n-- RATE LIMIT NOTICE --\n"
+    "A fail-safe email volume cap ({max} emails per recipient per {hours:g} "
+    "hours) has been reached for at least one recipient of this message. "
+    "The affected recipient(s) will receive no further email until the "
+    "rolling window clears; if you continue to receive messages, you are "
+    "not the affected recipient. Monitoring, enforcement, and logging "
+    "continue unaffected.\n"
+)
+
+# TEMPORARY (2026-09-06): the detector judges link topology only and cannot
+# tell a monitor-only (*2, receive-only) link from a transceive (*3) link.
+# Appended by the chokepoint to the categories below while that is true;
+# config notifications.monitor_link_caveat: false removes it.
+MONITOR_LINK_CAVEAT_INTERNAL = (
+    "\n\n-- NOTE ON MONITOR-ONLY LINKS (temporary) --\n"
+    "This detector cannot currently distinguish monitor-only (receive-only, "
+    "*2) AllStar links from transceive (*3) links. It treats both as "
+    "transceive and acts on link topology alone, so a guest whose links are "
+    "all monitor-only is still disconnected. Link modes as self-reported by "
+    "each node to AllStarLink stats are now recorded in the detector log, "
+    "and violation alerts include them where available (REPORTED LINK "
+    "MODES). When the detector's own map render is attached, monitor links "
+    "are drawn dashed with an open arrowhead pointing at the listening "
+    "node; the official AllStarLink map, drawn from the hub's point of "
+    "view, shows monitor-only links as two-way. A future version is "
+    "intended to take link mode into account. Please bear with this "
+    "limitation in the interim.\n"
+)
+MONITOR_LINK_CAVEAT_EXTERNAL = (
+    "\n\nPlease note: when deciding whether to disconnect a node, this "
+    "monitoring system does not yet take link mode into account — "
+    "monitor-only (receive-only) and transceive links are treated the same "
+    "for that purpose. We are aware of this limitation and hope to address "
+    "it in a future version. We appreciate your patience in the meantime.\n"
+)
+# Category gate: internal ops wording for the sysadmin stream, a neutral
+# sentence for the offender courtesy note, nothing for everything else
+# (analytics digest, awareness, vantage-trust, test, error).
+_MONITOR_CAVEAT_BY_CATEGORY = {
+    EmailCategory.VIOLATION_SYSADMIN: MONITOR_LINK_CAVEAT_INTERNAL,
+    EmailCategory.REPEAT_OFFENDER:    MONITOR_LINK_CAVEAT_INTERNAL,
+    EmailCategory.WATCHDOG_ACTION:    MONITOR_LINK_CAVEAT_INTERNAL,
+    EmailCategory.OFFENDER_COURTESY:  MONITOR_LINK_CAVEAT_EXTERNAL,
+}
+
+# Phase 2 (listeners.permit: true): the caveat above becomes false, so it is
+# REPLACED — not dropped — by a statement of the live rule and the safe
+# switching sequence (audit S7: the offender note must keep saying
+# something about link mode, and the ordering guidance is the remedy for
+# the "listener decides to talk" race).
+LISTENER_RULE_INTERNAL = (
+    "\n\n-- MONITOR-ONLY (LISTENER) LINKS --\n"
+    "This detector permits a guest whose EVERY AllStar link is monitor-only "
+    "(*2 monitor, or on ASL3 *75 local monitor; reported as R or L) by the "
+    "guest's own AllStarLink stats report — to the system node it hangs off "
+    "and to every outside node. Such a listener moves no audio across the "
+    "system boundary in either direction. Any transceive (*3) or unreported "
+    "link anywhere disqualifies it, and this event is one of those cases "
+    "(see REPORTED LINK MODES). Link mode is self-reported by the guest's "
+    "node, is not verified by this system, and is re-read every scan; a link "
+    "that flips to transceive changes no mesh membership, so it is caught by "
+    "the next full scan (poll interval, up to 5 min), not by the fast "
+    "link-change path. Platform note (verified 2026-09-07): HamVoIP reports "
+    "a LOCAL-monitor link as transceive (T), so a HamVoIP listener must use "
+    "plain *2. A node that is not posting to AllStarLink stats cannot be "
+    "classified: it is neither permitted nor cut, and only the hidden-path "
+    "cross-check can see it.\n"
+)
+LISTENER_RULE_WATCHDOG = (
+    "\n\n-- MONITOR-ONLY (LISTENER) LINKS --\n"
+    "This detector permits a guest whose EVERY AllStar link is monitor-only "
+    "(*2, receive-only) by the guest's own AllStarLink stats report. While "
+    "such a listener is present the vantage mesh includes the outside mesh "
+    "behind its monitor links, and the link-state watchdog runs against an "
+    "allowance frozen when the listener set was last registered; this alarm "
+    "means the foreign mesh count exceeded that allowance plus the "
+    "threshold. See /status link_watchdog for the listener ids and "
+    "allowance.\n"
+)
+LISTENER_RULE_EXTERNAL = (
+    "\n\nA note on monitor-only links: a node whose links to this system and "
+    "to every other node are ALL monitor-only (*2, receive-only; on ASL3 the "
+    "*75 local-monitor mode also counts) is permitted to listen. A single "
+    "transceive (*3) link to any node while linked to this system is treated "
+    "as bridging. Two requirements: your node must be posting its status to "
+    "AllStarLink stats (a node we cannot read is not recognised as a "
+    "listener), and HamVoIP nodes must use plain *2, because HamVoIP reports "
+    "a local-monitor link as transceive. If you wish to switch from "
+    "listening to talking on this system, please disconnect your other links "
+    "first and then reconnect to this system in transceive; when you are "
+    "done, disconnect from this system before reconnecting your other links. "
+    "If a link was made with a permanent-link command (*812, *813 or *818), "
+    "*1 will not release it; use *811 followed by the node number.\n"
+)
+_LISTENER_RULE_BY_CATEGORY = {
+    EmailCategory.VIOLATION_SYSADMIN: LISTENER_RULE_INTERNAL,
+    EmailCategory.REPEAT_OFFENDER:    LISTENER_RULE_INTERNAL,
+    EmailCategory.WATCHDOG_ACTION:    LISTENER_RULE_WATCHDOG,
+    EmailCategory.OFFENDER_COURTESY:  LISTENER_RULE_EXTERNAL,
+}
+
+
+def link_mode_text(category, permit_listeners: bool,
+                   monitor_link_caveat: bool) -> Optional[str]:
+    """Which link-mode paragraph (if any) a category's body gets: the
+    listener rule when listeners are permitted, else the temporary caveat
+    when enabled. Pure function so the selection is testable."""
+    if permit_listeners:
+        return _LISTENER_RULE_BY_CATEGORY.get(category)
+    if monitor_link_caveat:
+        return _MONITOR_CAVEAT_BY_CATEGORY.get(category)
+    return None
+
+
+class RecipientResolutionError(RuntimeError):
+    """Raised when secrets.yaml cannot be reduced to a non-empty
+    internal_recipients list. Fail-closed per audit C1."""
+
+
+class NotificationTracker:
+    """SQLite-backed rate-limit and dedup state for the Notifier.
+
+    Schema (2026-05-14 chokepoint refactor):
+      notifications              — per-event sends (now with type + status)
+      unusual_externals          — per-(host, peer_name) dedup
+      external_recipient_sends   — 6-hour-per-external-recipient cap (B)
+    """
+
+    def __init__(self, db_path: str = DB_FILE):
+        self.db_path = db_path
+        self._init_db()
+        self._cleanup_orphan_pending()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    offending_node INTEGER NOT NULL,
+                    hub_node INTEGER NOT NULL,
+                    bridge_node INTEGER NOT NULL,
+                    path_key TEXT NOT NULL DEFAULT '',
+                    message TEXT
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_notif_timestamp ON notifications(timestamp)")
+            # Forward-only migrations. Each ADD COLUMN is idempotent.
+            for ddl in (
+                "ALTER TABLE notifications ADD COLUMN path_key TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE notifications ADD COLUMN notification_type TEXT NOT NULL DEFAULT 'violation'",
+                "ALTER TABLE notifications ADD COLUMN status TEXT NOT NULL DEFAULT 'sent'",
+            ):
+                try:
+                    conn.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass  # column already present
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_notif_path_key ON notifications(path_key)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_notif_type ON notifications(notification_type)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_notif_status ON notifications(status)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS unusual_externals (
+                    host_node INTEGER NOT NULL,
+                    external_name TEXT NOT NULL,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    client_type TEXT,
+                    PRIMARY KEY (host_node, external_name)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS external_recipient_sends (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recipient_address TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ers_addr_time "
+                         "ON external_recipient_sends(recipient_address, sent_at)")
+            # (D) absolute per-recipient fail-safe: one row per envelope
+            # recipient per send attempt, ALL categories. PRE-written as
+            # 'pending' before the SMTP call and transitioned to sent/failed
+            # after — same crash-safe pattern as external_recipient_sends, so
+            # a send-then-crash loop still arms the cap (audit 2026-07-03 #4,
+            # S2). Self-pruning via record_recipient_sends_pending.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS recipient_sends (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recipient_address TEXT NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_rs_addr_time "
+                         "ON recipient_sends(recipient_address, sent_at)")
+            # Quiet-hours deferral queue (2026-10-12): an alert born during
+            # quiet hours waits here (persisted — survives SIGHUP/restart)
+            # and is delivered by Notifier.flush_deferred once they end.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS deferred_emails (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    html_body TEXT,
+                    attachments_json TEXT NOT NULL DEFAULT '[]',
+                    offender_address TEXT,
+                    tracker_row_id INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    updated_at TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 1,
+                    scope_external_json TEXT NOT NULL DEFAULT '[]',
+                    coalesce_key TEXT NOT NULL DEFAULT ''
+                )
+            """)
+            for ddl in (
+                "ALTER TABLE deferred_emails ADD COLUMN count INTEGER NOT NULL DEFAULT 1",
+                "ALTER TABLE deferred_emails ADD COLUMN scope_external_json TEXT NOT NULL DEFAULT '[]'",
+                "ALTER TABLE deferred_emails ADD COLUMN coalesce_key TEXT NOT NULL DEFAULT ''",
+            ):
+                try:
+                    conn.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_deferred_status "
+                         "ON deferred_emails(status, created_at)")
+
+    # ---- quiet-hours deferral queue (2026-10-12) ----
+
+    def enqueue_deferred(self, category: str, subject: str, body: str,
+                         html_body: Optional[str], attachments: list[str],
+                         offender_address: Optional[str],
+                         tracker_row_id: Optional[int],
+                         scope_external: Optional[list[str]] = None,
+                         coalesce_key: Optional[str] = None) -> tuple[int, int]:
+        """Queue one email; a queued row with the same (category,
+        coalesce_key) — the subject by default — is REPLACED (latest
+        subject/body/attachments win, count += 1, created_at kept) so a
+        condition that persists all night yields one email.
+        Returns (row_id, count)."""
+        now = datetime.now(timezone.utc).isoformat()
+        key = coalesce_key if coalesce_key is not None else subject
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT id, count FROM deferred_emails WHERE status='queued' "
+                "AND category=? AND coalesce_key=? ORDER BY created_at ASC LIMIT 1",
+                (category, key)).fetchone()
+            if row:
+                rid, cnt = int(row[0]), int(row[1]) + 1
+                old_tr = conn.execute("SELECT tracker_row_id FROM deferred_emails WHERE id=?",
+                                      (rid,)).fetchone()[0]
+                if (tracker_row_id is not None and old_tr is not None
+                        and int(old_tr) != int(tracker_row_id)):
+                    # The superseded notifications row must not stay 'deferred'
+                    # forever — it would hold a slot of the daily budget (R2).
+                    conn.execute("UPDATE notifications SET status='superseded' WHERE id=?",
+                                 (int(old_tr),))
+                conn.execute(
+                    "UPDATE deferred_emails SET subject=?, body=?, html_body=?, "
+                    "attachments_json=?, offender_address=COALESCE(?, offender_address), "
+                    "tracker_row_id=COALESCE(?, tracker_row_id), count=?, updated_at=? "
+                    "WHERE id=?",
+                    (subject, body, html_body, json.dumps(list(attachments or [])),
+                     offender_address, tracker_row_id, cnt, now, rid))
+                return rid, cnt
+            cur = conn.execute(
+                "INSERT INTO deferred_emails (created_at, category, subject, body, "
+                "html_body, attachments_json, offender_address, tracker_row_id, "
+                "attempts, status, updated_at, count, scope_external_json, coalesce_key) "
+                "VALUES (?,?,?,?,?,?,?,?,0,'queued',?,1,?,?)",
+                (now, category, subject, body, html_body,
+                 json.dumps(list(attachments or [])), offender_address,
+                 tracker_row_id, now, json.dumps(list(scope_external or [])), key))
+            return int(cur.lastrowid), 1
+
+    def prune_deferred(self, keep_days: int = 7) -> int:
+        """Delete delivered/expired/failed rows older than keep_days."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("DELETE FROM deferred_emails WHERE status != 'queued' "
+                               "AND updated_at < ?", (cutoff,))
+            return int(cur.rowcount or 0)
+
+    def fetch_deferred_queued(self, limit: int) -> list[dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM deferred_emails WHERE status='queued' "
+                "ORDER BY created_at ASC LIMIT ?", (int(limit),)).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_deferred(self, row_id: int, status: str, attempts: Optional[int] = None):
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            if attempts is None:
+                conn.execute("UPDATE deferred_emails SET status=?, updated_at=? WHERE id=?",
+                             (status, now, row_id))
+            else:
+                conn.execute("UPDATE deferred_emails SET status=?, attempts=?, updated_at=? "
+                             "WHERE id=?", (status, int(attempts), now, row_id))
+
+    def count_deferred_lost(self) -> dict:
+        """Expired / failed rows still in the table (7-day retention) — the
+        /status evidence that survives a SIGHUP (audit R5)."""
+        with sqlite3.connect(self.db_path) as conn:
+            out = {"expired": 0, "failed": 0}
+            for st, c in conn.execute("SELECT status, COUNT(*) FROM deferred_emails "
+                                      "WHERE status IN ('expired','failed') GROUP BY status"):
+                out[st] = int(c)
+            return out
+
+    def count_deferred_queued(self) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM deferred_emails WHERE status='queued'").fetchone()
+            return int(row[0]) if row else 0
+
+    def _cleanup_orphan_pending(self):
+        """Orphan 'pending' rows older than five minutes at startup are
+        upgraded to 'sent'. Defensive: a crash between sendmail and the
+        commit leaves a pending row — assume the send went out so we do not
+        re-send on the next scan (C3 fix)."""
+        cutoff = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                n1 = conn.execute(
+                    "UPDATE notifications SET status='sent' "
+                    "WHERE status='pending' AND timestamp < ?",
+                    (cutoff,)
+                ).rowcount
+                n2 = conn.execute(
+                    "UPDATE external_recipient_sends SET status='sent' "
+                    "WHERE status='pending' AND sent_at < ?",
+                    (cutoff,)
+                ).rowcount
+                n3 = conn.execute(
+                    "UPDATE recipient_sends SET status='sent' "
+                    "WHERE status='pending' AND sent_at < ?",
+                    (cutoff,)
+                ).rowcount
+            if n1 or n2 or n3:
+                logger.warning(
+                    "Startup: upgraded orphan pending row(s): %d notifications, "
+                    "%d external_recipient_sends, %d recipient_sends "
+                    "(presumed sent before crash).",
+                    n1, n2, n3
+                )
+        except sqlite3.Error as e:
+            logger.error("Startup orphan-pending cleanup failed: %s", e)
+
+    # ---- counter reads (fail-closed on DB error: return inf → caller blocks) ----
+
+    def recipient_send_count(self, address: str, hours: float) -> float:
+        """Send attempts to this address in the trailing window, all
+        categories (the (D) absolute fail-safe). Counts 'sent' AND 'pending'
+        (conservative: an in-flight/crashed attempt counts) but not 'failed'.
+        Read-only — pruning happens in record_recipient_sends_pending.
+        Fail-closed: a DB error returns inf so the caller suppresses rather
+        than storms."""
+        cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM recipient_sends "
+                    "WHERE recipient_address = ? AND sent_at > ? "
+                    "AND status IN ('sent','pending')",
+                    (address, cutoff)
+                ).fetchone()
+                return row[0] if row else 0
+        except sqlite3.Error as e:
+            logger.error("recipient_send_count fail-closed: %s", e)
+            return float("inf")
+
+    def record_recipient_sends_pending(self, addresses: list[str],
+                                       keep_hours: float) -> list[int]:
+        """PRE-write one 'pending' row per envelope recipient (crash-safe:
+        the cap is armed even if we die mid-send). Also prunes rows older
+        than max(48h, keep_hours) so a window larger than 48h is never
+        undercounted (audit 2026-07-03 #4, S3). Raises sqlite3.Error to the
+        caller — a failed pre-write must abort the send (fail-closed)."""
+        now = datetime.utcnow()
+        prune_cutoff = (now - timedelta(hours=max(48.0, keep_hours))).isoformat()
+        ids = []
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM recipient_sends WHERE sent_at < ?",
+                         (prune_cutoff,))
+            for a in addresses:
+                cur = conn.execute(
+                    "INSERT INTO recipient_sends "
+                    "(recipient_address, sent_at, status) "
+                    "VALUES (?, ?, 'pending')", (a, now.isoformat()))
+                ids.append(cur.lastrowid)
+        return ids
+
+    def mark_recipient_sends_status(self, row_ids: list[int],
+                                    status: str) -> None:
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.executemany(
+                    "UPDATE recipient_sends SET status = ? WHERE id = ?",
+                    [(status, rid) for rid in row_ids])
+        except sqlite3.Error as e:
+            logger.error("mark_recipient_sends_status failed (rows stay "
+                         "pending → still count toward the cap): %s", e)
+
+    def count_recent(self, minutes: float = 15.0,
+                     notification_type: str = "violation") -> float:
+        cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM notifications "
+                    "WHERE timestamp > ? AND notification_type = ? "
+                    "AND status IN ('sent','pending','deferred')",
+                    (cutoff, notification_type)
+                ).fetchone()
+                return row[0] if row else 0
+        except sqlite3.Error as e:
+            logger.error("count_recent fail-closed: %s", e)
+            return float("inf")
+
+    def count_today(self, notification_type: str = "violation") -> float:
+        today_start = datetime.utcnow().replace(
+            hour=0, minute=0, second=0, microsecond=0).isoformat()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM notifications "
+                    "WHERE timestamp > ? AND notification_type = ? "
+                    "AND status IN ('sent','pending','deferred')",
+                    (today_start, notification_type)
+                ).fetchone()
+                return row[0] if row else 0
+        except sqlite3.Error as e:
+            logger.error("count_today fail-closed: %s", e)
+            return float("inf")
+
+    def count_last_24h(self, notification_type: str) -> float:
+        cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM notifications "
+                    "WHERE timestamp > ? AND notification_type = ? "
+                    "AND status IN ('sent','pending','deferred')",
+                    (cutoff, notification_type)
+                ).fetchone()
+                return row[0] if row else 0
+        except sqlite3.Error as e:
+            logger.error("count_last_24h fail-closed: %s", e)
+            return float("inf")
+
+    def last_notification_for_path(self, event: BridgingEvent) -> Optional[datetime]:
+        path_key = event.path_description
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT timestamp FROM notifications WHERE path_key = ? "
+                    "AND notification_type = 'violation' "
+                    "AND status IN ('sent','pending','deferred') "
+                    "ORDER BY timestamp DESC LIMIT 1",
+                    (path_key,)
+                ).fetchone()
+                return datetime.fromisoformat(row[0]) if row else None
+        except sqlite3.Error as e:
+            logger.error("last_notification_for_path fail-closed: %s", e)
+            # Fail-closed: act as if a recent send blocks this path.
+            return datetime.utcnow()
+
+    def last_courtesy_for_offender(self, offending_node: int) -> Optional[datetime]:
+        """D2 (2026-09-08): when this offender last RECEIVED a courtesy note
+        (a 'sent' offender_courtesy row keyed by node, not by path). Fail-
+        closed: a broken tracker reads as 'just sent'."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT timestamp FROM notifications WHERE offending_node = ? "
+                    "AND notification_type = 'offender_courtesy' "
+                    "AND status IN ('sent','pending','deferred') ORDER BY timestamp DESC LIMIT 1",
+                    (int(offending_node),)
+                ).fetchone()
+                return datetime.fromisoformat(row[0]) if row else None
+        except (sqlite3.Error, ValueError, TypeError) as e:
+            logger.error("last_courtesy_for_offender fail-closed: %s", e)
+            return datetime.utcnow()
+
+    # ---- pending-write helpers ----
+
+    def record_pending_notification(self, event: BridgingEvent,
+                                    notification_type: str) -> int:
+        hub_node = event.path[0] if event.path else 0
+        bridge_node = event.path[1] if len(event.path) > 1 else 0
+        path_key = event.path_description
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                "INSERT INTO notifications "
+                "(timestamp, offending_node, hub_node, bridge_node, path_key, "
+                " message, notification_type, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+                (datetime.utcnow().isoformat(), event.offending_node,
+                 hub_node, bridge_node, path_key, str(event), notification_type)
+            )
+            return cur.lastrowid
+
+    def record_pending_hidden_path(self) -> int:
+        """Pre-write a hidden-path notification row. Uses synthetic offender 0
+        because by definition the API could not identify the offending node."""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                "INSERT INTO notifications "
+                "(timestamp, offending_node, hub_node, bridge_node, path_key, "
+                " message, notification_type, status) "
+                "VALUES (?, 0, 0, 0, ?, ?, 'hidden_path', 'pending')",
+                (datetime.utcnow().isoformat(),
+                 "hidden_path_alert",
+                 "hidden-path alert (no specific offender)")
+            )
+            return cur.lastrowid
+
+    def record_pending_simple(self, notification_type: str,
+                              note: str = "") -> int:
+        """Pre-write a row for non-event categories (OPERATOR_AWARENESS,
+        TEST, ERROR_REPORT)."""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                "INSERT INTO notifications "
+                "(timestamp, offending_node, hub_node, bridge_node, path_key, "
+                " message, notification_type, status) "
+                "VALUES (?, 0, 0, 0, ?, ?, ?, 'pending')",
+                (datetime.utcnow().isoformat(), notification_type, note,
+                 notification_type)
+            )
+            return cur.lastrowid
+
+    def mark_notification_status(self, row_id: int, status: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE notifications SET status = ? WHERE id = ?",
+                (status, row_id)
+            )
+
+    # ---- 6-hour external-recipient cap (Invariant B) ----
+
+    def external_recipient_sent_within(self, addr: str, hours: int) -> bool:
+        cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM external_recipient_sends "
+                    "WHERE recipient_address = ? AND sent_at > ? "
+                    "AND status IN ('sent','pending') LIMIT 1",
+                    (addr, cutoff)
+                ).fetchone()
+                return row is not None
+        except sqlite3.Error as e:
+            logger.error("external_recipient_sent_within fail-closed: %s", e)
+            return True  # fail-closed: pretend recently sent → block
+
+    def record_pending_external_send(self, addr: str,
+                                     category: EmailCategory) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                "INSERT INTO external_recipient_sends "
+                "(recipient_address, category, sent_at, status) "
+                "VALUES (?, ?, ?, 'pending')",
+                (addr, category.value, datetime.utcnow().isoformat())
+            )
+            return cur.lastrowid
+
+    def mark_external_send_status(self, row_id: int, status: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE external_recipient_sends SET status = ? WHERE id = ?",
+                (status, row_id)
+            )
+
+    # ---- unusual-externals dedup (unchanged from prior version) ----
+
+    def get_alerted_unusual_externals(self) -> set[tuple[int, str]]:
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT host_node, external_name FROM unusual_externals"
+                ).fetchall()
+            return {(int(h), str(n)) for h, n in rows}
+        except sqlite3.Error as e:
+            logger.error("get_alerted_unusual_externals: %s", e)
+            return set()
+
+    def mark_unusual_external_alerted(self, host_node: int, external_name: str,
+                                       client_type: Optional[str], now_iso: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO unusual_externals "
+                "(host_node, external_name, first_seen, last_seen, client_type) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (int(host_node), str(external_name), now_iso, now_iso,
+                 client_type or ""),
+            )
+
+    def touch_unusual_external(self, host_node: int, external_name: str,
+                                now_iso: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE unusual_externals SET last_seen = ? "
+                "WHERE host_node = ? AND external_name = ?",
+                (now_iso, int(host_node), str(external_name)),
+            )
+
+    def clear_unusual_external(self, host_node: int, external_name: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "DELETE FROM unusual_externals "
+                "WHERE host_node = ? AND external_name = ?",
+                (int(host_node), str(external_name)),
+            )
+
+
+class Notifier:
+    """Manages notifications with rate limiting, quiet hours, and the
+    single-chokepoint email-dispatch invariant set."""
+
+    def __init__(self, config: dict):
+        self.config = config
+        self.tracker = NotificationTracker(
+            db_path=str(Path(config.get("db_path", DB_FILE)))
+        )
+        self.rate_limits = config.get("rate_limits", {})
+        self.quiet_config = config.get("quiet_hours", {})
+        self.email_config = config.get("notifications", {}).get("email", {})
+
+        # 6-hour external cap (B). Configurable; default 6.
+        self.external_cooldown_hours = int(
+            self.rate_limits.get("external_recipient_cooldown_hours", 6)
+        )
+
+        # ERROR_REPORT volume cap. Default 4/24h.
+        self.error_report_max_per_day = int(
+            self.rate_limits.get("error_report_max_per_day", 4)
+        )
+
+        # (D) ABSOLUTE per-recipient volume fail-safe (2026-07-03, Bennett).
+        # Outermost guard at the chokepoint; NO category bypasses it — not
+        # REPEAT_OFFENDER, not ERROR_REPORT, not ANALYTICS. At most this many
+        # emails to any single address per rolling window; the final allowed
+        # email to an address at the threshold carries a rate-limit notice.
+        # Pathological-worst-case backstop, active even with defaults.
+        # Malformed YAML falls back to defaults (a typo here must not kill
+        # the daemon at startup); floor of 1 (0/negative would be a
+        # permanent email blackout, which config cannot be allowed to say).
+        try:
+            self.absolute_recipient_max = max(1, int(
+                self.rate_limits.get("absolute_recipient_max_per_window", 18)))
+        except (TypeError, ValueError):
+            logger.error("Bad absolute_recipient_max_per_window in config; "
+                         "using default 18")
+            self.absolute_recipient_max = 18
+        try:
+            self.absolute_recipient_window_hours = max(0.1, float(
+                self.rate_limits.get("absolute_recipient_window_hours", 6)))
+        except (TypeError, ValueError):
+            logger.error("Bad absolute_recipient_window_hours in config; "
+                         "using default 6")
+            self.absolute_recipient_window_hours = 6.0
+        # Temporary monitor-link caveat paragraph (see MONITOR_LINK_CAVEAT_*).
+        # Default on; a SIGHUP reload rebuilds the Notifier and re-reads it.
+        _notif = config.get("notifications") or {}
+        self.monitor_link_caveat = _notif.get("monitor_link_caveat", True) is not False
+        # Phase 2: when listeners are permitted the caveat is replaced by the
+        # rule text (see _LISTENER_RULE_BY_CATEGORY), never shown alongside.
+        # Same strict test as the daemon's _listener_cfg (`is True`), so the
+        # emails never describe a rule the analyzer is not applying.
+        self.permit_listeners = (
+            (config.get("listeners") or {}).get("permit", False) is True)
+
+        # Defense-in-depth gate (C). Detector sets this each scan; chokepoint
+        # also enforces. Default True (fail-closed: a freshly-constructed
+        # Notifier with no explicit set_dry_run() call refuses to send).
+        self._dry_run: bool = True
+
+        # Health tracking for the StatusCollector.
+        self._email_healthy: bool = True
+        # Quiet-hours deferral queue (for /status); refreshed on enqueue and
+        # flush. Read once here so a restart shows the backlog. The
+        # expired/failed counters are since this Notifier was built.
+        try:
+            self._deferred_queued: int = self.tracker.count_deferred_queued()
+        except sqlite3.Error:
+            self._deferred_queued = 0
+        try:
+            lost = self.tracker.count_deferred_lost()
+        except sqlite3.Error:
+            lost = {"expired": 0, "failed": 0}
+        self._deferred_expired: int = lost["expired"]     # table-derived (survive SIGHUP)
+        self._deferred_failed: int = lost["failed"]
+        self._deferred_hold_until: float = 0.0            # monotonic; spacing + retry back-off
+        self._deferred_last_prune: float = 0.0
+        self._deferred_refusal_logged: set = set()
+        self._last_dispatch_outcome: str = "refused"
+        self._last_email_send: Optional[str] = None
+        self._qrz_healthy: bool = True
+
+        # Resolve internal_recipients FAIL-CLOSED (C1).
+        self._internal_recipients = self._resolve_internal_recipients()
+        # External recipients = full list minus internal.
+        all_recipients = list(self.email_config.get("recipients") or [])
+        self._external_recipients = [
+            a for a in all_recipients if a not in self._internal_recipients
+        ]
+        # notifications.email.internal_only (2026-09-08, Bennett: "suppress
+        # all emails to anyone else until the new version has some miles on
+        # it"): ONE switch that keeps every category internal — trustees get
+        # nothing, and the offender courtesy note is redirected to the
+        # internal recipients instead of the offender. Per-category
+        # allow_external flags are untouched; flip this back to false (and
+        # SIGHUP) to restore them. Only the literal boolean true engages it.
+        self.internal_only: bool = self.email_config.get("internal_only") is True
+        # notifications.email.internal_only_send_offender_notes (2026-09-10,
+        # Bennett after the first real cut: "enable outgoing emails to
+        # violators; I'll decide case by case whether to forward to the
+        # trustees"): while internal-only, the OFFENDER_COURTESY note goes to
+        # the offender again (BCC internal); every other category, and the
+        # trustees, stay suppressed. Only the literal boolean true engages it.
+        self.internal_only_offender_notes: bool = (
+            self.internal_only
+            and self.email_config.get("internal_only_send_offender_notes") is True)
+        if self.internal_only:
+            logger.warning(
+                "EMAIL INTERNAL-ONLY MODE: external recipients %s suppressed for "
+                "EVERY category; offender courtesy notes go to %s "
+                "(notifications.email.internal_only: true)",
+                self._external_recipients,
+                "the OFFENDER (bcc internal) — internal_only_send_offender_notes: true"
+                if self.internal_only_offender_notes else "internal recipients only")
+            self._external_recipients = []
+        logger.info(
+            "Recipient scope resolved: internal=%s external=%s",
+            self._internal_recipients, self._external_recipients
+        )
+
+        # Analytics DB (read-only) for the sysadmin email's offense-history
+        # annotation (Bennett, 2026-07-17). Same relative-path anchoring as
+        # the daemon's _build_analytics; None disables the annotation. ALL
+        # config access inside the try — malformed YAML must not kill the
+        # Notifier at startup.
+        self._analytics_db_path: Optional[Path] = None
+        try:
+            acfg = config.get("analytics") or {}
+            if isinstance(acfg, dict) and acfg.get("enabled", False):
+                p = Path(acfg.get("db_path", "analytics.db"))
+                if not p.is_absolute():
+                    p = Path(__file__).parent / p
+                self._analytics_db_path = p
+        except Exception as e:
+            logger.error("Analytics config unusable for offense history "
+                         "(annotation disabled): %s", e)
+
+        # QRZ.
+        qrz_config = config.get("qrz", {})
+        self.qrz: Optional[QRZLookup] = None
+        if qrz_config.get("enabled", False):
+            username = qrz_config.get("username", "")
+            password = qrz_config.get("password", "")
+            if username and password:
+                self.qrz = QRZLookup(username, password)
+                logger.info("QRZ callsign lookup: ENABLED")
+            else:
+                logger.warning("QRZ enabled but credentials missing")
+
+    def set_dry_run(self, dry_run: bool):
+        """Detector calls this before each scan with the effective
+        dry_run / monitor_only state. The chokepoint will refuse to
+        send when True."""
+        self._dry_run = bool(dry_run)
+
+    # ------------------------------------------------------------------
+    # Recipient resolution (C1)
+    # ------------------------------------------------------------------
+
+    def _resolve_internal_recipients(self) -> list[str]:
+        """Resolve the Bennett-only list, fail-closed.
+
+        Precedence:
+          1. notifications.email.internal_recipients (preferred, new field)
+          2. notifications.email.hidden_path_recipients (legacy, deprecated)
+
+        Raises RecipientResolutionError if neither yields a non-empty list
+        AFTER stripping whitespace-only entries. We do NOT silently fall
+        back to the full recipients list (the 2026-05-03 flood scenario).
+        """
+        cfg = self.email_config
+
+        def _clean(raw) -> list[str]:
+            if not isinstance(raw, list):
+                return []
+            return [str(a).strip() for a in raw if str(a).strip()]
+
+        explicit = _clean(cfg.get("internal_recipients"))
+        if explicit:
+            return explicit
+
+        # Field present but all entries blank/whitespace — this is a config
+        # bug that must NOT silently fall back. Audit C-1 (2026-05-15 self-review).
+        if cfg.get("internal_recipients") is not None:
+            raise RecipientResolutionError(
+                "secrets.yaml: 'internal_recipients' is present but contains "
+                "no non-empty entries after stripping whitespace. Provide an "
+                "explicit Bennett email address."
+            )
+
+        legacy = _clean(cfg.get("hidden_path_recipients"))
+        if legacy:
+            logger.warning(
+                "Using legacy 'hidden_path_recipients' as internal_recipients. "
+                "Rename to 'internal_recipients' in secrets.yaml."
+            )
+            return legacy
+
+        if cfg.get("hidden_path_recipients") is not None:
+            raise RecipientResolutionError(
+                "secrets.yaml: 'hidden_path_recipients' is present but "
+                "contains no non-empty entries after stripping whitespace."
+            )
+
+        raise RecipientResolutionError(
+            "secrets.yaml: neither 'internal_recipients' nor "
+            "'hidden_path_recipients' is set to a non-empty list under "
+            "notifications.email. The detector refuses to start without an "
+            "explicit Bennett-only recipient list — silently falling back to "
+            "the full recipients list is the failure mode that caused the "
+            "2026-05-03 incident."
+        )
+
+    # ------------------------------------------------------------------
+    # Quiet hours (C7: fail-closed)
+    # ------------------------------------------------------------------
+
+    def is_quiet_hours(self) -> bool:
+        """True if current time is within quiet hours. On ANY parsing/config
+        exception this returns True (fail-closed: behave as if quiet so
+        sysadmin emails are suppressed; offender courtesy is the only path
+        that bypasses quiet hours and is unaffected)."""
+        if not self.quiet_config.get("enabled", False):
+            return False
+        try:
+            tz = ZoneInfo(self.quiet_config.get("timezone", "America/Chicago"))
+            now = datetime.now(tz)
+            start_str = self.quiet_config.get("start", "22:00")
+            end_str = self.quiet_config.get("end", "07:00")
+            start_h, start_m = map(int, start_str.split(":"))
+            end_h, end_m = map(int, end_str.split(":"))
+            start_minutes = start_h * 60 + start_m
+            end_minutes = end_h * 60 + end_m
+            now_minutes = now.hour * 60 + now.minute
+            if start_minutes > end_minutes:
+                return now_minutes >= start_minutes or now_minutes < end_minutes
+            return start_minutes <= now_minutes < end_minutes
+        except Exception as e:
+            logger.error("Error parsing quiet_hours config — failing CLOSED "
+                         "(treating as quiet): %s", e)
+            return True
+
+    def flush_deferred(self) -> int:
+        """Deliver alerts queued during quiet hours (2026-10-12). Called once
+        per scan cycle by the daemon. No-op while quiet hours are in effect
+        or while the hold clock runs: DEFERRED_MIN_SPACING_S after a
+        delivery (the 07:00 cycle runs every 15 s at the top of the hour —
+        a burst would burn the absolute recipient cap; audit C2),
+        DEFERRED_RETRY_SPACING_S after a transient SMTP failure (R1).
+        Up to DEFERRED_SCAN_LIMIT rows are examined oldest-first and the
+        FIRST deliverable one is sent; a row REFUSED by policy (cap, dry-run,
+        no recipients) is held without counting an attempt and does not
+        block newer rows (R3). A permanent message-specific SMTP rejection
+        ('smtp_rejected', DATA-stage 5xx) is lost at once — one row per
+        cycle at most. Delivery re-applies caps, scope and
+        internal-only, with the external scope capped at what was allowed
+        when the row was queued (S4). Rows older than DEFERRED_MAX_AGE_HOURS
+        expire unsent; DEFERRED_MAX_ATTEMPTS transient failures mark a row
+        failed. Loss is counted for /status (table-derived) and reported via
+        ERROR_REPORT (best effort — R5). Never raises."""
+        now_m = time.monotonic()
+        try:
+            if self.is_quiet_hours() or now_m < self._deferred_hold_until:
+                return 0
+            rows = self.tracker.fetch_deferred_queued(DEFERRED_SCAN_LIMIT)
+        except Exception as e:
+            logger.error("flush_deferred: could not read the queue: %s", e)
+            return 0
+        if now_m - self._deferred_last_prune >= DEFERRED_PRUNE_INTERVAL_S:
+            # Hourly housekeeping whatever the queue state (N4/N6): sweep the
+            # 7-day retention and refresh the table-derived loss counters.
+            self._deferred_last_prune = now_m
+            try:
+                self.tracker.prune_deferred()
+                lost = self.tracker.count_deferred_lost()
+                self._deferred_expired, self._deferred_failed = lost["expired"], lost["failed"]
+            except Exception:
+                pass
+        if not rows:
+            self._deferred_queued = 0
+            return 0
+        delivered = 0
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            rid = row.get("id")
+            lost_reason = None            # set when the row leaves the queue unsent
+            stop = False                  # set when this cycle's delivery slot is used
+            try:
+                created = datetime.fromisoformat(row["created_at"])
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                age_h = (now - created).total_seconds() / 3600.0
+                category = EmailCategory(row["category"])
+                if age_h > DEFERRED_MAX_AGE_HOURS:
+                    self.tracker.mark_deferred(rid, 'expired')
+                    lost_reason = f"expired after {age_h:.1f} h"
+                    logger.warning("Deferred email #%d (%s, %r) is %.1f h old — expired, "
+                                   "not sent", rid, row["category"], row["subject"], age_h)
+                    continue
+                try:
+                    local_tz = ZoneInfo(self.quiet_config.get("timezone", "America/Chicago"))
+                except Exception:
+                    local_tz = timezone.utc
+                born = created.astimezone(local_tz).strftime("%Y-%m-%d %H:%M %Z")
+                cnt = int(row.get("count") or 1)
+                repeat_note = (f" This condition was reported {cnt} times overnight; "
+                               f"this is the latest report." if cnt > 1 else "")
+                banner = (f"DELAYED DELIVERY: this alert was generated at {born}, during "
+                          f"quiet hours ({self.quiet_config.get('start', '22:00')}–"
+                          f"{self.quiet_config.get('end', '07:00')}), and held until "
+                          f"they ended. The situation may have changed since.{repeat_note}\n\n")
+                paths = []
+                try:
+                    for p in json.loads(row.get("attachments_json") or "[]"):
+                        if Path(p).is_file():
+                            paths.append(Path(p))
+                except Exception:
+                    pass
+                try:
+                    allow = list(json.loads(row.get("scope_external_json") or "[]"))
+                except Exception:
+                    allow = []
+                html_body = row.get("html_body")
+                if html_body:
+                    hb = ("<p><b>DELAYED DELIVERY:</b> generated " + html.escape(born)
+                          + " during quiet hours; held until they ended."
+                          + html.escape(repeat_note) + "</p>")
+                    html_body = (html_body.replace("</body>", hb + "</body>", 1)
+                                 if "</body>" in html_body else hb + html_body)
+                prefix = self.email_config.get("subject_prefix", "[ASL Link Alert]")
+                subj = row["subject"]
+                if subj.startswith(prefix):
+                    subj = subj[len(prefix):].lstrip()
+                ok = self._dispatch_email(
+                    category, "[delayed] " + subj, banner + row["body"],
+                    attachments=paths or None,
+                    offender_address=row.get("offender_address"),
+                    tracker_row_id=row.get("tracker_row_id"),
+                    html_body=html_body, _from_deferred=True,
+                    _external_allowlist=allow)
+                outcome = getattr(self, "_last_dispatch_outcome", "refused")
+                attempts = int(row.get("attempts") or 0)
+                if ok:
+                    self.tracker.mark_deferred(rid, 'sent', attempts + 1)
+                    self._deferred_hold_until = now_m + DEFERRED_MIN_SPACING_S
+                    self._deferred_refusal_logged.discard(rid)
+                    delivered += 1
+                    stop = True
+                    logger.info("Deferred email #%d delivered (%s, %r, count=%d)", rid,
+                                row["category"], row["subject"], cnt)
+                elif outcome == "smtp_rejected":
+                    # Permanent, row-specific rejection (5xx): retrying would
+                    # fail the same way and stall the queue (N3) — lose it now.
+                    # stop=True: at most ONE row can leave the queue per cycle
+                    # even if the classification is ever wrong (blast radius).
+                    self.tracker.mark_deferred(rid, 'failed', attempts + 1)
+                    lost_reason = "rejected by the SMTP server (permanent 5xx)"
+                    stop = True
+                    logger.error("Deferred email #%d rejected by SMTP — not retried (%s, %r)",
+                                 rid, row["category"], row["subject"])
+                elif outcome == "smtp_failed":
+                    attempts += 1
+                    self._deferred_hold_until = now_m + DEFERRED_RETRY_SPACING_S
+                    stop = True
+                    if attempts >= DEFERRED_MAX_ATTEMPTS:
+                        self.tracker.mark_deferred(rid, 'failed', attempts)
+                        lost_reason = f"SMTP failed {attempts} times"
+                        logger.error("Deferred email #%d failed %d times — giving up (%s, %r)",
+                                     rid, attempts, row["category"], row["subject"])
+                    else:
+                        self.tracker.mark_deferred(rid, 'queued', attempts)
+                        logger.warning("Deferred email #%d not delivered (SMTP attempt %d/%d) "
+                                       "— retry in %d s", rid, attempts, DEFERRED_MAX_ATTEMPTS,
+                                       DEFERRED_RETRY_SPACING_S)
+                else:
+                    # Refused by policy (cap / dry-run / no recipients): hold
+                    # it, no attempt counted; restore the tracker row to
+                    # 'deferred' (the cap path sets it 'failed') so the dedupe
+                    # window holds (C3); try the NEXT row this cycle (R3).
+                    self.tracker.mark_deferred(rid, 'queued', attempts)
+                    if row.get("tracker_row_id") is not None:
+                        try:
+                            self.tracker.mark_notification_status(row["tracker_row_id"], 'deferred')
+                        except sqlite3.Error:
+                            pass
+                    if rid not in self._deferred_refusal_logged:
+                        self._deferred_refusal_logged.add(rid)
+                        logger.warning("Deferred email #%d held (delivery refused: %s) — "
+                                       "will keep trying until it expires", rid, outcome)
+                    else:
+                        logger.debug("Deferred email #%d still refused (%s)", rid, outcome)
+            except Exception as e:
+                # A poisoned row must not wedge the queue (S6).
+                lost_reason = f"unprocessable ({e})"
+                logger.error("flush_deferred: row #%s unprocessable — marked failed: %s", rid, e)
+                try:
+                    self.tracker.mark_deferred(rid, 'failed')
+                except Exception:
+                    pass
+            finally:
+                if lost_reason and row.get("tracker_row_id") is not None:
+                    # Free the dedupe/daily-budget slot (S9).
+                    try:
+                        self.tracker.mark_notification_status(row["tracker_row_id"], 'failed')
+                    except Exception:
+                        pass
+                if lost_reason:
+                    self._deferred_refusal_logged.discard(rid)
+                    try:
+                        self.report_error(
+                            f"Deferred alert LOST: {row.get('subject', '?')}",
+                            f"A quiet-hours deferred alert was not delivered: {lost_reason}.\n"
+                            f"category={row.get('category')} queued={row.get('created_at')} "
+                            f"count={row.get('count')}\n\nThe original text follows.\n\n"
+                            f"{row.get('body', '')}")
+                    except Exception:
+                        pass
+            if stop:
+                break
+        if delivered == 0 and rows:
+            # Nothing deliverable this cycle (all refused): pace the retries
+            # so the top-of-hour 15 s cadence does not hammer the queue.
+            self._deferred_hold_until = max(self._deferred_hold_until,
+                                            now_m + DEFERRED_MIN_SPACING_S)
+        try:
+            self._deferred_queued = self.tracker.count_deferred_queued()
+            lost = self.tracker.count_deferred_lost()
+            self._deferred_expired, self._deferred_failed = lost["expired"], lost["failed"]
+        except Exception:
+            pass
+        return delivered
+
+    # ------------------------------------------------------------------
+    # Violation rate-limit gate (unchanged semantics, type-scoped queries)
+    # ------------------------------------------------------------------
+
+    def can_notify(self, event: BridgingEvent) -> tuple[bool, str]:
+        window_min = self.rate_limits.get("window_minutes", 15)
+        max_per_window = self.rate_limits.get("max_per_window", 2)
+        if self.tracker.count_recent(minutes=window_min) >= max_per_window:
+            return False, f"window limit ({max_per_window}/{window_min}min) reached"
+
+        max_daily = self.rate_limits.get("max_per_day", 24)
+        if self.tracker.count_today() >= max_daily:
+            return False, f"daily limit ({max_daily}/day) reached"
+
+        cooldown_min = self.rate_limits.get("cooldown_per_path_minutes", 15)
+        last = self.tracker.last_notification_for_path(event)
+        if last is not None:
+            elapsed = (datetime.utcnow() - last).total_seconds() / 60
+            if elapsed < cooldown_min:
+                remaining = cooldown_min - elapsed
+                return False, (f"cooldown for path '{event.path_description}' "
+                               f"({remaining:.0f}min remaining)")
+        return True, "ok"
+
+    # ==================================================================
+    # THE CHOKEPOINT — the ONLY function in this module that calls
+    # smtplib.SMTP.sendmail. Do not duplicate.
+    # ==================================================================
+
+    def _dispatch_email(self,
+                        category: EmailCategory,
+                        subject: str,
+                        body: str,
+                        attachments: Optional[list[Path]] = None,
+                        offender_address: Optional[str] = None,
+                        tracker_row_id: Optional[int] = None,
+                        html_body: Optional[str] = None,
+                        _from_deferred: bool = False,
+                        _external_allowlist: Optional[list[str]] = None,
+                        _coalesce_key: Optional[str] = None,
+                        ) -> bool:
+        """Send one email, applying invariants (A), (B), (C).
+        `_from_deferred`: this is flush_deferred re-dispatching a queued
+        alert — never re-queue it. `_external_allowlist`: the external
+        addresses the alert was allowed to reach when it was queued; delivery
+        never WIDENS that (a config flip overnight must not send alerts
+        authored under a narrower policy to new recipients).
+        Sets `self._last_dispatch_outcome` to one of 'sent', 'deferred',
+        'smtp_failed' (transient — retry), 'smtp_rejected' (permanent,
+        message-specific 5xx — do not retry) or 'refused' (policy / cap /
+        dry-run / no recipient — hold) so a caller can tell them apart.
+
+        Args:
+            category: Routing class.
+            subject, body, attachments: Message content.
+            html_body: Optional HTML alternative. When provided, the message
+                is sent as multipart/alternative (text/plain `body` first as
+                the fallback, then text/html). Mail clients render the HTML.
+            offender_address: For OFFENDER_COURTESY only — the To: address.
+                External recipients become BCC. Ignored for other categories.
+            tracker_row_id: If the caller has already pre-written a row in
+                the `notifications` table, pass its id so we transition
+                it from 'pending' to 'sent'/'failed'. If None, the chokepoint
+                pre-writes a row for this category.
+
+        Returns True iff at least one envelope was successfully sent.
+        """
+        self._last_dispatch_outcome = "refused"
+        if category not in CATEGORY_POLICY:
+            logger.error("BUG: unknown email category %r — refusing to send.",
+                         category)
+            return False
+
+        policy = CATEGORY_POLICY[category]
+
+        # (C) Universal dry-run / monitor-only gate. ERROR_REPORT bypasses
+        # this gate because its recipient is Bennett-only (category-A
+        # invariant guarantees) and monitor_only is meant to suppress
+        # externally-visible side effects, not silence Bennett.
+        if self._dry_run and not policy.get("bypass_dry_run", False):
+            logger.info("Email suppressed (dry-run / monitor-only): "
+                        "category=%s subject=%r", category.value, subject)
+            if tracker_row_id is not None:
+                try:
+                    self.tracker.mark_notification_status(tracker_row_id, 'failed')
+                except sqlite3.Error:
+                    pass
+            return False
+
+        if not self.email_config.get("enabled", False):
+            logger.warning("Email not enabled in config; logging only. "
+                           "category=%s subject=%r", category.value, subject)
+            if tracker_row_id is not None:
+                try:
+                    self.tracker.mark_notification_status(tracker_row_id, 'failed')
+                except sqlite3.Error:
+                    pass
+            return False
+
+        # Quiet-hours gate (categories that respect quiet hours).
+        if not policy["bypass_quiet"] and self.is_quiet_hours():
+            if policy.get("defer_quiet") and not _from_deferred:
+                # 2026-10-12: queue it for delivery when quiet hours end
+                # (flush_deferred) and tell the caller it was ACCEPTED (True):
+                # callers that retry on False (dark_guest notices, like
+                # vantage_trust) must not re-submit every scan (audit C1).
+                # One queued row per (category, subject): a repeat replaces
+                # the body and bumps the count (audit C1/S1). The tracker row
+                # becomes 'deferred', which the dedupe queries count as
+                # notified. The external scope allowed NOW is stored so
+                # delivery can never widen it (audit S4).
+                try:
+                    scope_ext = (list(self._external_recipients)
+                                 if policy["allow_external"] else [])
+                    # Coalescing key: the caller's explicit key (violations:
+                    # offender|path; watchdog: action|target), else the subject.
+                    ckey = _coalesce_key if _coalesce_key else subject
+                    qid, repeat = self.tracker.enqueue_deferred(
+                        category.value, subject, body, html_body,
+                        [str(p) for p in (attachments or [])],
+                        offender_address, tracker_row_id, scope_ext,
+                        coalesce_key=ckey)
+                    if tracker_row_id is not None:
+                        self.tracker.mark_notification_status(tracker_row_id, 'deferred')
+                    self._deferred_queued = self.tracker.count_deferred_queued()
+                    self._last_dispatch_outcome = "deferred"
+                    logger.warning("Email DEFERRED (quiet hours %s–%s): category=%s "
+                                   "subject=%r — %s #%d for delivery when quiet "
+                                   "hours end",
+                                   self.quiet_config.get("start", "22:00"),
+                                   self.quiet_config.get("end", "07:00"),
+                                   category.value, subject,
+                                   f"repeat {repeat} coalesced into" if repeat > 1
+                                   else "queued as", qid)
+                    return True
+                except Exception as e:
+                    logger.error("Could not queue deferred email (%s) — dropping "
+                                 "as before: category=%s subject=%r",
+                                 e, category.value, subject)
+            logger.info("Email suppressed (quiet hours): category=%s subject=%r",
+                        category.value, subject)
+            if tracker_row_id is not None:
+                try:
+                    self.tracker.mark_notification_status(tracker_row_id, 'failed')
+                except sqlite3.Error:
+                    pass
+            return False
+
+        # (A) Recipient resolution by category.
+        internal = list(self._internal_recipients)
+        external = list(self._external_recipients) if policy["allow_external"] else []
+        if _external_allowlist is not None:
+            external = [a for a in external if a in _external_allowlist]
+
+        # (B) 6-hour external cap, per-address. Categories with
+        # bypass_external_cap (REPEAT_OFFENDER only) skip the CHECK but still
+        # pre-write cap rows below, so their sends arm/extend the cooldown
+        # for the ordinary categories.
+        bypass_ext_cap = policy.get("bypass_external_cap", False)
+        external_kept = []
+        external_capped = []
+        for addr in external:
+            if not bypass_ext_cap and self.tracker.external_recipient_sent_within(
+                    addr, self.external_cooldown_hours):
+                external_capped.append(addr)
+            else:
+                external_kept.append(addr)
+        if external_capped:
+            logger.info(
+                "6-hour external cap suppressed %s for category=%s",
+                external_capped, category.value
+            )
+
+        # Compose envelope recipient set + To/Cc/Bcc headers.
+        if category == EmailCategory.OFFENDER_COURTESY:
+            if not offender_address:
+                logger.warning("OFFENDER_COURTESY with no offender_address; "
+                               "skipping.")
+                if tracker_row_id is not None:
+                    self.tracker.mark_notification_status(tracker_row_id, 'failed')
+                return False
+            if self.internal_only and not self.internal_only_offender_notes:
+                # The offender is an external party too: the note goes to
+                # the internal recipients only, so the operator still sees
+                # exactly what WOULD have been sent (subject unchanged).
+                if not internal:
+                    logger.warning("OFFENDER_COURTESY in internal-only mode with no "
+                                   "internal recipients; skipping.")
+                    if tracker_row_id is not None:
+                        self.tracker.mark_notification_status(tracker_row_id, 'failed')
+                    return False
+                logger.info("internal-only mode: courtesy note for %s redirected to "
+                            "internal recipients %s (NOT sent to the offender)",
+                            offender_address, internal)
+                to_header = ", ".join(internal)
+                envelope_recipients = list(internal)
+            else:
+                to_header = offender_address
+                bcc = internal + external_kept
+                envelope_recipients = [offender_address] + bcc
+        else:
+            primary = internal + external_kept
+            if not primary:
+                logger.warning(
+                    "No recipients after (A)/(B) for category=%s; "
+                    "skipping send.", category.value
+                )
+                if tracker_row_id is not None:
+                    self.tracker.mark_notification_status(tracker_row_id, 'failed')
+                return False
+            to_header = ", ".join(primary)
+            envelope_recipients = primary
+
+        # (D) ABSOLUTE per-recipient fail-safe — the outermost guard, applied
+        # to the final envelope regardless of category. See
+        # apply_absolute_recipient_cap. When it drops an address, the To:
+        # header may still show it (cosmetic); delivery is envelope-driven.
+        envelope_recipients, cap_notice = apply_absolute_recipient_cap(
+            self.tracker, envelope_recipients,
+            self.absolute_recipient_max, self.absolute_recipient_window_hours,
+            category.value)
+        if not envelope_recipients:
+            logger.error(
+                "ABSOLUTE recipient cap: ALL recipients suppressed for "
+                "category=%s subject=%r — not sending.", category.value, subject)
+            # Surface on the HA tile: total suppression (incl. the fail-closed
+            # broken-tracker case) must not read as healthy (audit S1).
+            self._email_healthy = False
+            if tracker_row_id is not None:
+                try:
+                    self.tracker.mark_notification_status(tracker_row_id, 'failed')
+                except sqlite3.Error:
+                    pass
+            return False
+        # Externals dropped by the cap must not get external-cap rows either.
+        external_kept = [a for a in external_kept if a in envelope_recipients]
+        # 2026-09-10 audit S1: an outbound courtesy note must never go to the
+        # offender WITHOUT an internal copy — the internal address rides every
+        # category's envelope and is the one most likely to hit the cap, and
+        # the operator decides case by case what to forward. No copy, no send.
+        if (category == EmailCategory.OFFENDER_COURTESY
+                and internal and not any(a in envelope_recipients for a in internal)):
+            logger.error(
+                "ABSOLUTE recipient cap dropped every internal copy of the "
+                "OFFENDER_COURTESY note for %s — not sending it to the offender "
+                "unsupervised.", offender_address)
+            self._email_healthy = False
+            if tracker_row_id is not None:
+                try:
+                    self.tracker.mark_notification_status(tracker_row_id, 'failed')
+                except sqlite3.Error:
+                    pass
+            return False
+        # The notice never rides on the offender courtesy email (audit S4):
+        # that message is deliberately diplomatic and goes to a non-trusted
+        # external party — internal ops text does not belong there. Trustees
+        # at threshold learn from their own sysadmin-stream emails.
+        if cap_notice and category == EmailCategory.OFFENDER_COURTESY:
+            logger.info("Rate-limit notice suppressed on OFFENDER_COURTESY "
+                        "body (policy); a recipient of this send is at the cap.")
+            cap_notice = False
+        # Temporary monitor-link caveat, category-gated, ahead of the
+        # rate-limit notice so that notice stays last.
+        caveat = link_mode_text(category, self.permit_listeners,
+                                self.monitor_link_caveat)
+        if caveat:
+            body += caveat
+            if html_body:
+                html_caveat = "<p>" + html.escape(caveat.strip()) + "</p>"
+                if "</body>" in html_body:
+                    html_body = html_body.replace("</body>",
+                                                  html_caveat + "</body>", 1)
+                else:
+                    html_body += html_caveat
+        if cap_notice:
+            notice = RATE_LIMIT_NOTICE_TEXT.format(
+                max=self.absolute_recipient_max,
+                hours=self.absolute_recipient_window_hours)
+            body += notice
+            if html_body:
+                html_notice = ("<p><strong>-- RATE LIMIT NOTICE --</strong> "
+                               + html.escape(notice.strip().split("\n", 1)[1].strip())
+                               + "</p>")
+                if "</body>" in html_body:
+                    html_body = html_body.replace("</body>",
+                                                  html_notice + "</body>", 1)
+                else:
+                    html_body += html_notice
+        # (D) PRE-write the cap rows (crash-safe arming — a send-then-crash
+        # loop still counts; audit S2). A failed pre-write aborts the send,
+        # matching the external-cap invariant.
+        try:
+            rs_row_ids = self.tracker.record_recipient_sends_pending(
+                envelope_recipients, self.absolute_recipient_window_hours)
+        except sqlite3.Error as e:
+            logger.error("Pre-write of recipient_sends failed; refusing to "
+                         "send. %s", e)
+            self._email_healthy = False
+            if tracker_row_id is not None:
+                try:
+                    self.tracker.mark_notification_status(tracker_row_id, 'failed')
+                except sqlite3.Error:
+                    pass
+            return False
+
+        # Pre-write external-recipient cap rows for each kept external.
+        ers_row_ids: list[int] = []
+        try:
+            for addr in external_kept:
+                rid = self.tracker.record_pending_external_send(addr, category)
+                ers_row_ids.append(rid)
+        except sqlite3.Error as e:
+            logger.error("Pre-write of external_recipient_sends failed; "
+                         "refusing to send. %s", e)
+            if tracker_row_id is not None:
+                try:
+                    self.tracker.mark_notification_status(tracker_row_id, 'failed')
+                except sqlite3.Error:
+                    pass
+            return False
+
+        # If the caller didn't pre-write a notifications row, do it now.
+        owned_row_id = None
+        if tracker_row_id is None:
+            try:
+                owned_row_id = self.tracker.record_pending_simple(
+                    notification_type=category.value, note=subject)
+            except sqlite3.Error as e:
+                logger.error("Pre-write of notifications row failed; "
+                             "refusing to send. %s", e)
+                for rid in ers_row_ids:
+                    try:
+                        self.tracker.mark_external_send_status(rid, 'failed')
+                    except sqlite3.Error:
+                        pass
+                return False
+
+        # Build the MIME message.
+        cfg = self.email_config
+        msg = MIMEMultipart("mixed")
+        prefix = cfg.get("subject_prefix", "[ASL Link Alert]")
+        msg["Subject"] = f"{prefix} {subject}" if not subject.startswith(prefix) else subject
+        msg["From"] = cfg.get("from_addr", cfg.get("username", ""))
+        msg["To"] = to_header
+        if html_body:
+            # multipart/alternative: plain-text fallback first, HTML second.
+            alt = MIMEMultipart("alternative")
+            alt.attach(MIMEText(body, "plain"))
+            alt.attach(MIMEText(html_body, "html"))
+            msg.attach(alt)
+        else:
+            msg.attach(MIMEText(body, "plain"))
+        for att in (attachments or []):
+            try:
+                # Local evidence renders are PNG; official-map shots are JPEG.
+                # Python 3.13 removed imghdr auto-detection, so derive the
+                # subtype from the suffix (audit 2026-07-17).
+                subtype = "png" if att.suffix.lower() == ".png" else "jpeg"
+                img_part = MIMEImage(att.read_bytes(), _subtype=subtype)
+                img_part.add_header("Content-Disposition", "attachment",
+                                    filename=att.name)
+                msg.attach(img_part)
+            except Exception as e:
+                logger.warning("Failed to attach %s: %s", att, e)
+
+        # Send.
+        success = False
+        try:
+            # timeout added 2026-08-22 (audit S6): a black-holed SMTP
+            # connection must not hang the scan loop indefinitely.
+            server = smtplib.SMTP(cfg["smtp_server"], cfg.get("smtp_port", 587),
+                                  timeout=30)
+            if cfg.get("use_tls", True):
+                server.starttls()
+            server.login(cfg["username"], cfg["password"])
+            server.sendmail(
+                cfg.get("from_addr", cfg["username"]),
+                envelope_recipients,
+                msg.as_string()
+            )
+            server.quit()
+            success = True
+            self._email_healthy = True
+            self._last_dispatch_outcome = "sent"
+            self._last_email_send = datetime.now(timezone.utc).isoformat()
+            logger.info(
+                "Email sent: category=%s recipients=%s (external_kept=%s)",
+                category.value, envelope_recipients, external_kept
+            )
+        except Exception as e:
+            self._email_healthy = False
+            # A row-specific 5xx (recipient/sender/data refused, e.g. message
+            # too large) will fail again identically — report it as a
+            # REJECTION so the deferral queue drops it instead of retrying for
+            # an hour and stalling every other row (audit N3). Auth and
+            # connection failures are global and transient: retry.
+            # Classification (audit N3, rounds 4-5): permanent ONLY on a 5xx
+            # that is specific to THIS message — the DATA stage refusing it
+            # (e.g. 552 too large), or every recipient refused with 5xx.
+            # Everything else is transient and holds the queue: 4xx
+            # (greylisting, rate limits), a refused SENDER (config — would
+            # hit every row), auth failures, and connect/HELO/STARTTLS
+            # banners (an IP-reputation block presents as a 554 banner).
+            # The isinstance guards make the attribute reads safe.
+            permanent = False
+            try:
+                if isinstance(e, smtplib.SMTPRecipientsRefused):
+                    codes = [int(c) for c, _ in (e.recipients or {}).values()]
+                    permanent = bool(codes) and all(500 <= c < 600 for c in codes)
+                elif isinstance(e, smtplib.SMTPDataError):
+                    permanent = 500 <= int(e.smtp_code) < 600
+            except (TypeError, ValueError):
+                permanent = False
+            self._last_dispatch_outcome = "smtp_rejected" if permanent else "smtp_failed"
+            logger.error("Email send failed: category=%s err=%s",
+                         category.value, e)
+
+        # Transition counter rows.
+        final_status = 'sent' if success else 'failed'
+        rid_for_notification = tracker_row_id if tracker_row_id is not None else owned_row_id
+        try:
+            if rid_for_notification is not None:
+                self.tracker.mark_notification_status(rid_for_notification, final_status)
+            for rid in ers_row_ids:
+                self.tracker.mark_external_send_status(rid, final_status)
+        except sqlite3.Error as e:
+            logger.error("Failed to transition tracker rows from pending: %s", e)
+        # (D) cap rows: sent stays counted, failed drops out of the count.
+        self.tracker.mark_recipient_sends_status(rs_row_ids, final_status)
+
+        return success
+
+    # ==================================================================
+    # Path #1 — VIOLATION_SYSADMIN
+    # ==================================================================
+
+    def notify(self, scan_result: ScanResult,
+               bubble_image_path: Optional[str] = None,
+               rpt_link_info: Optional[str] = None,
+               disc_outcomes: Optional[dict] = None,
+               bubble_image_is_local_render: bool = False,
+               secondary_local_render: Optional[str] = None) -> int:
+        """rpt_link_info: optional pre-formatted summary of the SSH vantage
+        node's app_rpt link state (rpt_reader), captured at detection time
+        where possible. Sysadmin email only — internal telemetry, not for
+        the offender courtesy notice.
+
+        disc_outcomes: {offending_node -> DisconnectResult} from the
+        detection-time auto-disconnect, so the sysadmin email describes what
+        was actually DONE instead of recommending an action that already
+        happened (Bennett, 2026-07-17).
+
+        secondary_local_render: our own render attached ALONGSIDE the
+        official shot when a monitor-only link is involved (the official
+        map, drawn from the hub's point of view, shows such links as
+        two-way; Bennett, 2026-09-06)."""
+        if not scan_result.has_problems:
+            return 0
+        sent_count = 0
+        # D2 (2026-09-08): one courtesy note per OFFENDER per scan. A scan
+        # emits one event per outside target from a single fetch of the
+        # offender's record; on 2026-09-07 23:43 four went to one operator
+        # in 10 s (the sysadmin rows were quiet-hours 'failed', so the
+        # window limit never saw them).
+        courtesy_done: set = set()
+        for event in scan_result.bridging_events:
+            allowed, reason = self.can_notify(event)
+            if not allowed:
+                logger.info("Notification suppressed for node %s: %s",
+                            event.offending_node, reason)
+                continue
+
+            # Pre-write the notifications row before sending (C3).
+            try:
+                row_id = self.tracker.record_pending_notification(
+                    event, notification_type="violation")
+            except sqlite3.Error as e:
+                logger.error("Pre-write failed for violation: %s — skipping send",
+                             e)
+                continue
+
+            attach_path = self._resolve_attachment(bubble_image_path)
+            # The second map rides only on the event whose offender actually
+            # has a drawn monitor link — not on every event in the scan.
+            monitor_involved = event_has_monitor_link(scan_result, event)
+            local_path = (self._resolve_attachment(secondary_local_render)
+                          if monitor_involved else None)
+            attachments = [p for p in (attach_path, local_path) if p]
+
+            subject = (f"Unauthorized bridging by node {event.offending_node} "
+                       f"({event.offending_callsign})")
+            # Offense history (sysadmin email only — the courtesy note stays
+            # neutral). Fail-safe: None means "lookup unavailable" and the
+            # section is omitted; [] means "confirmed first recorded offense".
+            prior_eps = None
+            if self._analytics_db_path is not None:
+                try:
+                    prior_eps = prior_offense_episodes(
+                        self._analytics_db_path,
+                        int(event.offending_node),
+                        scan_result.timestamp)
+                except Exception as e:
+                    logger.warning("Offense-history lookup failed "
+                                   "(non-fatal, section omitted): %s", e)
+            body = self._format_email_body(
+                event, scan_result,
+                disc_result=(disc_outcomes or {}).get(event.offending_node),
+                prior_episodes=prior_eps)
+            if rpt_link_info:
+                body += f"\n{rpt_link_info}\n"
+            body += self._map_attachment_note(
+                attach_path, local_path, bubble_image_is_local_render,
+                monitor_involved, audience="sysadmin")
+
+            sysadmin_ok = self._dispatch_email(
+                EmailCategory.VIOLATION_SYSADMIN,
+                subject=subject,
+                body=body,
+                attachments=attachments,
+                tracker_row_id=row_id,
+                # quiet-hours coalescing per offender AND path (audit R6)
+                _coalesce_key=f"{event.offending_node}|{event.path_description}",
+            )
+
+            # Offender courtesy email (path #2) — independent send, bypasses quiet.
+            if self.qrz and event.offending_callsign and event.offending_callsign != "Unknown":
+                skip = self._courtesy_skip_reason(event, disc_outcomes, courtesy_done)
+                if skip:
+                    logger.info("Courtesy note for node %s not sent: %s",
+                                event.offending_node, skip)
+                else:
+                    courtesy_done.add(int(event.offending_node))
+                    self._notify_offender(event, scan_result, bubble_image_path,
+                                          bubble_image_is_local_render,
+                                          secondary_local_render)
+
+            if sysadmin_ok:
+                sent_count += 1
+        return sent_count
+
+    @staticmethod
+    def _resolve_attachment(image_path: Optional[str]) -> Optional[Path]:
+        if not image_path:
+            return None
+        p = Path(image_path)
+        if not p.is_file():
+            logger.warning("Bubble attachment not found at %s, sending without", p)
+            return None
+        return p
+
+    @staticmethod
+    def _map_attachment_note(official: Optional[Path], local: Optional[Path],
+                             is_local_only: bool, monitor_involved: bool,
+                             audience: str) -> str:
+        """Cover-email sentence(s) naming the attached map(s). `official` is
+        the attachment slot the detector filled (the official ASL.org shot,
+        or — when is_local_only — our own render standing in for it);
+        `local` is our render attached ALONGSIDE the official shot.
+        audience: "sysadmin" (internal wording) or "offender" (neutral)."""
+        if audience not in ("sysadmin", "offender"):
+            raise ValueError(f"unknown audience {audience!r}")
+        sysadmin = audience == "sysadmin"
+        if official is None and local is not None:
+            # The official slot was lost (e.g. pruned between render and
+            # send); our render is then the only map and must be named.
+            official, local, is_local_only = local, None, True
+        if official is None:
+            return ""
+        if local is not None and not is_local_only:
+            if sysadmin:
+                return (
+                    f"\nTwo maps are attached. {official.name} is the official "
+                    f"AllStarLink map captured at scan time. It is drawn from the "
+                    f"hub's point of view and shows monitor-only links as two-way. "
+                    f"{local.name} is this system's "
+                    f"own rendering of the same topology, built from each node's "
+                    f"own report: a monitor-only (receive-only) link is drawn as a "
+                    f"dashed line with an open arrowhead pointing at the listening "
+                    f"node. Where the two maps differ on a link's direction, the "
+                    f"local rendering reflects the listening node's self-report.\n")
+            return (
+                f"\nTwo maps are attached for your reference. {official.name} is "
+                f"the AllStarLink map captured at the time of detection; it shows "
+                f"monitor-only links as two-way. {local.name} is this system's rendering "
+                f"of the same connections, in which a monitor-only (receive-only) "
+                f"link is drawn as a dashed line with an open arrowhead pointing "
+                f"at the listening node.\n")
+        arrow_note = (" Monitor-only (receive-only) links are drawn dashed with an "
+                      "open arrowhead pointing at the listening node."
+                      if monitor_involved else "")
+        if is_local_only:
+            if sysadmin:
+                return (f"\nThe official ASL.org bubble map did not capture the "
+                        f"short-lived violation topology, so this system's own "
+                        f"rendering of the detected topology is attached as "
+                        f"{official.name}.{arrow_note}\n")
+            return (f"\nA rendering of the connection topology observed at the "
+                    f"time of detection is attached as {official.name} for your "
+                    f"reference.{arrow_note}\n")
+        if sysadmin:
+            return (f"\nThe bubble map captured at scan time is attached as "
+                    f"{official.name}.\n")
+        return (f"\nThe bubble map captured at the time of detection is attached "
+                f"as {official.name} for your reference.\n")
+
+    # ==================================================================
+    # Path #2 — OFFENDER_COURTESY
+    # ==================================================================
+
+    def _courtesy_skip_reason(self, event: BridgingEvent,
+                              disc_outcomes: Optional[dict],
+                              courtesy_done: set) -> str:
+        """D2 (2026-09-08): why NOT to send a courtesy note for this event.
+        Empty string = send. Three gates, each fail-safe toward silence:
+        (1) one note per offender per scan; (2) none on a re-detection whose
+        auto-disconnect was skipped for cooldown — that is an UNVERIFIED
+        echo inside the disconnect window, not a new offense the operator
+        needs telling about again; (3) a per-offender cooldown across scans
+        (rate_limits.offender_courtesy_cooldown_minutes, default 60)."""
+        try:
+            node = int(event.offending_node)
+        except (TypeError, ValueError):
+            return "no usable offending_node"
+        if node in courtesy_done:
+            return "already sent for this offender in this scan"
+        outcome = (disc_outcomes or {}).get(node)
+        if outcome is not None and getattr(outcome, "action", "") == "skipped_cooldown":
+            return ("re-detection inside the disconnect cooldown (unverified "
+                    "echo) — the note for the verified event already went out")
+        try:
+            cool_min = float(self.rate_limits.get(
+                "offender_courtesy_cooldown_minutes", 60))
+        except (TypeError, ValueError):
+            cool_min = 60.0
+        if cool_min > 0:
+            last = self.tracker.last_courtesy_for_offender(node)
+            if last is not None:
+                elapsed = (datetime.utcnow() - last).total_seconds() / 60
+                if elapsed < cool_min:
+                    return (f"per-offender courtesy cooldown "
+                            f"({cool_min - elapsed:.0f} min remaining)")
+        return ""
+
+    def _notify_offender(self, event: BridgingEvent, scan_result: ScanResult,
+                         bubble_image_path: Optional[str] = None,
+                         bubble_image_is_local_render: bool = False,
+                         secondary_local_render: Optional[str] = None):
+        callsign = event.offending_callsign
+        if not callsign or callsign == "Unknown":
+            return
+
+        qrz_info = self.qrz.lookup(callsign)
+        self._qrz_healthy = qrz_info is not None
+        if qrz_info is None:
+            logger.warning("QRZ lookup failed for %s", callsign)
+            return
+        offender_email = qrz_info.get("email", "")
+        if not offender_email:
+            logger.info("QRZ: no email on file for %s", callsign)
+            return
+        # 2026-09-10 audit S2: the address is a third-party string (QRZ) that
+        # lands in To: AND the SMTP envelope — accept one plain address only.
+        if not is_plain_email_address(offender_email):
+            logger.warning("QRZ: email on file for %s is not a single plain "
+                           "address (%r) — courtesy note not sent", callsign,
+                           offender_email[:80])
+            return
+        offender_email = offender_email.strip()
+
+        offender_name =f"{qrz_info.get('fname', '')} {qrz_info.get('name', '')}".strip()
+        if not offender_name:
+            offender_name = callsign
+
+        attach_path = self._resolve_attachment(bubble_image_path)
+        monitor_involved = event_has_monitor_link(scan_result, event)
+        local_path = (self._resolve_attachment(secondary_local_render)
+                      if monitor_involved else None)
+        attachments = [p for p in (attach_path, local_path) if p]
+
+        subject = (f"AllStarLink — Courtesy notice regarding node "
+                   f"{event.offending_node}")
+        body = self._format_offender_email(event, scan_result, offender_name, callsign)
+        body += self._map_attachment_note(
+            attach_path, local_path, bubble_image_is_local_render,
+            monitor_involved, audience="offender")
+
+        # Pre-write a row keyed by OFFENDER (D2): the per-offender cooldown
+        # reads it back; dispatch transitions it to sent/failed.
+        row_id = None
+        try:
+            row_id = self.tracker.record_pending_notification(
+                event, notification_type="offender_courtesy")
+        except sqlite3.Error as e:
+            logger.error("Pre-write failed for offender courtesy: %s — "
+                         "skipping send", e)
+            return
+        self._dispatch_email(
+            EmailCategory.OFFENDER_COURTESY,
+            subject=subject,
+            body=body,
+            attachments=attachments,
+            offender_address=offender_email,
+            tracker_row_id=row_id,
+        )
+
+    # ==================================================================
+    # Path #3 — HIDDEN_PATH_ANOMALY
+    # ==================================================================
+
+    def send_hidden_path_alert(self, scan_timestamp: str,
+                              image_max_distance: int,
+                              api_max_depth: int,
+                              warnings: list[str],
+                              image_path: Optional[str] = None) -> bool:
+        """Hidden-path alerts use a type-scoped counter (C2/C4 fix) and
+        route through the chokepoint with category HIDDEN_PATH_ANOMALY
+        (Bennett-only, respects quiet hours)."""
+        max_hourly = self.rate_limits.get("max_per_hour", 3)
+        if self.tracker.count_recent(minutes=60.0,
+                                     notification_type='hidden_path') >= max_hourly:
+            logger.info("Hidden-path alert suppressed: hourly rate limit "
+                        "(%d/hour) reached", max_hourly)
+            return False
+        max_daily = self.rate_limits.get("max_per_day_hidden_path", 5)
+        if self.tracker.count_today(notification_type='hidden_path') >= max_daily:
+            logger.info("Hidden-path alert suppressed: daily safety net "
+                        "(%d/day) reached", max_daily)
+            return False
+
+        try:
+            row_id = self.tracker.record_pending_hidden_path()
+        except sqlite3.Error as e:
+            logger.error("Pre-write failed for hidden-path: %s — skipping", e)
+            return False
+
+        attach_path = self._resolve_attachment(image_path)
+        attachments = [attach_path] if attach_path else []
+
+        warning_text = "\n".join(f"  - {w}" for w in warnings)
+        attach_note = (f"\nThe bubble map captured at scan time is attached "
+                       f"as {attach_path.name}.\n" if attach_path else "")
+        body = f"""AllStarLink HIDDEN PATH Bridging Alert
+=====================================
+
+Detected at: {scan_timestamp}
+
+The bubble map image analysis detected nodes at distance {image_max_distance}
+from the focus node, but the API-based scan only found nodes at depth
+{api_max_depth}. This discrepancy suggests unauthorized bridging through
+a node whose connection list is not visible to the API.
+
+CROSS-CHECK WARNINGS:
+{warning_text}
+
+This is a HIDDEN PATH alert — the API cannot identify the specific
+offending node. Check the bubble map at:
+  https://stats.allstarlink.org/stats/<FOCUS_NODE>/networkMap
+{attach_note}
+RECOMMENDED ACTION:
+  Visually inspect the bubble map to identify the bridging path.
+  The offending node may be a non-reporting guest node.
+
+---
+This is an automated alert from the ASL Intersystem Link Detector.
+"""
+        subject = (f"HIDDEN PATH — Image detects possible bridging "
+                   f"(distance {image_max_distance})")
+        return self._dispatch_email(
+            EmailCategory.HIDDEN_PATH_ANOMALY,
+            subject=subject,
+            body=body,
+            attachments=attachments,
+            tracker_row_id=row_id,
+        )
+
+    # ==================================================================
+    # Path #4 — OPERATOR_AWARENESS (reclassified 2026-05-14)
+    # Previously routed to full recipients; per audit, classifier is fragile
+    # enough that this is anomaly-class and goes to Bennett only until
+    # field-validated.
+    # ==================================================================
+
+    def process_unusual_externals(self, scan_result: ScanResult) -> int:
+        if not self.email_config.get("enabled", False):
+            return 0
+
+        observed: dict[tuple[int, str], dict] = {}
+        for key, info in scan_result.topology.items():
+            if info.get("role") != "permitted_external":
+                continue
+            ext_name = info.get("callsign", "")
+            if not is_unusual_external_name(ext_name):
+                continue
+            try:
+                host_node = int(info.get("parent") or 0)
+            except (TypeError, ValueError):
+                host_node = 0
+            if host_node == 0:
+                continue
+            observed[(host_node, ext_name)] = {
+                "host_node": host_node,
+                "external_name": ext_name,
+                "client_type": info.get("client_type", "webtransceiver_type"),
+                "host_info": scan_result.topology.get(host_node, {}),
+                "scan_timestamp": scan_result.timestamp,
+            }
+
+        alerted_before = self.tracker.get_alerted_unusual_externals()
+        now_iso = datetime.utcnow().isoformat()
+
+        gone = alerted_before - set(observed.keys())
+        for host_node, ext_name in gone:
+            logger.info("Unusual external '%s' on node %s no longer observed; "
+                        "clearing dedup state.", ext_name, host_node)
+            self.tracker.clear_unusual_external(host_node, ext_name)
+
+        new_alerts = 0
+        for pair, ctx in observed.items():
+            if pair in alerted_before:
+                self.tracker.touch_unusual_external(pair[0], pair[1], now_iso)
+                continue
+
+            subject = (f"UNUSUAL external '{ctx['external_name']}' observed on "
+                       f"node {ctx['host_node']} "
+                       f"({ctx['host_info'].get('callsign', '?')})")
+            body = self._format_unusual_external_body(ctx)
+            sent = self._dispatch_email(
+                EmailCategory.OPERATOR_AWARENESS,
+                subject=subject,
+                body=body,
+            )
+            if sent:
+                self.tracker.mark_unusual_external_alerted(
+                    ctx["host_node"], ctx["external_name"],
+                    ctx.get("client_type"), now_iso,
+                )
+                new_alerts += 1
+        return new_alerts
+
+    @staticmethod
+    def _format_unusual_external_body(ctx: dict) -> str:
+        host_info = ctx.get("host_info", {}) or {}
+        return f"""AllStarLink Unusual External Connection — Operator Awareness Alert
+====================================================================
+
+Detected at: {ctx.get('scan_timestamp', '?')}
+
+UNUSUAL EXTERNAL:
+  Peer name:        '{ctx['external_name']}'
+  Client type:      {ctx.get('client_type', 'webtransceiver_type')}
+  Host node:        {ctx['host_node']}
+  Host callsign:    {host_info.get('callsign', '?')}
+  Host location:    {host_info.get('location', '?')}
+  Host role:        {host_info.get('role', '?')}
+
+WHY THIS IS UNUSUAL:
+  The peer name does not match the amateur-radio callsign pattern that
+  WebTransceiver, RepeaterPhone, and softphone clients normally use, and
+  it does not match the chan_echolink "EchoLink-NNNNNN" format. Peer
+  names like 'DVSwitch', 'IAX_Bridge', 'Analog_Bridge', 'MMDVM_Bridge',
+  'analog_bridge', or arbitrary session labels fall into this category.
+
+WHAT THIS MEANS:
+  This connection has NOT been detected as forming a bridge to other
+  networks. The detector continues to allow it as a permitted leaf
+  attachment. The classifier raised this for human review only.
+
+NO INTERVENTION:
+  No auto-disconnect has been or will be performed for this connection.
+
+---
+This is an automated alert from the ASL Intersystem Link Detector.
+"""
+
+    # ==================================================================
+    # Path #5 — TEST (Bennett-only; gated by ASL_ALLOW_TEST_EMAIL env var
+    # in the CLI handler in asl_link_detector.py)
+    # ==================================================================
+
+    def send_repeat_offender_alert(self, offender: int, callsign: str,
+                                   strikes: int, reappearances: int,
+                                   path_description: str,
+                                   window_minutes: int) -> bool:
+        """Watch-mode escalation (link_watch.py): the offender re-bridged and
+        was verified-disconnected `strikes` times inside one watch window.
+        Bypasses quiet hours by category policy (2026-07-02 decision)."""
+        subject = (f"REPEAT OFFENDER: node {offender} ({callsign}) — "
+                   f"{strikes} verified re-offenses after auto-disconnect")
+        body = (
+            f"Post-violation watch mode has verified {strikes} repeat "
+            f"offense(s) by node {offender} ({callsign}) within a "
+            f"{window_minutes}-minute watch window.\n\n"
+            f"Each strike means: after being auto-disconnected, the node "
+            f"reconnected AND was re-verified to be bridging the system to "
+            f"an outside AllStar network again, and was auto-disconnected "
+            f"again. Total reappearances observed (including ones that were "
+            f"benign or unverified): {reappearances}.\n\n"
+            f"Most recent violation path:\n  {path_description}\n\n"
+            f"A node that auto-reconnects and re-bridges this persistently "
+            f"is likely misconfigured (auto-reconnect script) or deliberate. "
+            f"Auto-disconnect alone will not keep it off the system; manual "
+            f"intervention (contacting the operator, or a temporary block at "
+            f"the bridge node) may be needed.\n\n"
+            f"This alert intentionally bypasses quiet hours (2026-07-02 "
+            f"policy: persistent re-offense warrants immediate notice). "
+            f"Watch mode continues until the window expires; further "
+            f"re-offenses in this window are kicked but not re-alerted.\n"
+        )
+        return self._dispatch_email(
+            EmailCategory.REPEAT_OFFENDER,
+            subject=subject,
+            body=body,
+        )
+
+    def send_watchdog_alert(self, foreign_count: int, threshold: int,
+                            sample: list, bridge: object, target: object,
+                            action: str, message: str) -> bool:
+        """Link-state watchdog action/decision record (Bennett-only)."""
+        subject = (f"LINK-STATE WATCHDOG: {foreign_count} foreign entries "
+                   f"(>= {threshold}) — {action}")
+        body = (
+            f"The link-state watchdog observed {foreign_count} mesh entries "
+            f"not accounted for by the stats-API topology (threshold "
+            f"{threshold}, confirmed over consecutive polls).\n\n"
+            f"Sample of foreign entries:\n  "
+            + ", ".join(str(s) for s in sample) + "\n\n"
+            f"Attribution: bridge {bridge}, target {target}\n"
+            f"Action taken: {action}\n"
+            f"Detail: {message}\n\n"
+            f"This trigger is independent of the stats API's bridging view — "
+            f"it fires on excess link-state advertisement itself (mass "
+            f"bridging the API can't see yet, or a wedged node gossiping "
+            f"stale reachability). Bennett-only while in debugging phase "
+            f"(2026-07-21 policy).\n"
+        )
+        return self._dispatch_email(
+            EmailCategory.WATCHDOG_ACTION, subject=subject, body=body,
+            # quiet-hours coalescing per ACTION and TARGET (audit R4): two
+            # cuts of different nodes stay two emails; repeated notices fold.
+            _coalesce_key=f"{action}|{target}")
+
+    def send_vantage_trust_alert(self, old: str, new: str,
+                                 reason: str, block: dict) -> bool:
+        """Vantage-trust transition notice (internal-only, 2026-08-22).
+
+        Returns the dispatcher's verdict so the caller can keep an
+        undelivered notice pending (quiet hours, caps, SMTP failure) and
+        retry next scan — never report False as sent (audit C1)."""
+        subject = f"VANTAGE TRUST: {old} -> {new}"
+        if new == "ok":
+            headline = ("The vantage node's health feed reports the fast "
+                        "detection layer healthy again.")
+        else:
+            headline = (
+                "The fast detection layer (tripwire + link-state watchdog "
+                "at the vantage node) should be considered "
+                f"{new.upper()} — enforcement continues on the stats-API "
+                "layer, which is independent of the vantage.")
+        body = (
+            f"{headline}\n\n"
+            f"Trust transition: {old} -> {new}\n"
+            f"Reason: {reason}\n"
+            f"Source overall: {block.get('overall')}\n"
+            f"Watched checks not acceptable: "
+            f"{', '.join(block.get('failing_watched') or []) or '(none)'}\n"
+            f"Source: {block.get('source')}\n"
+            f"Source age: {block.get('source_age_s')}s\n\n"
+            "Context: after the 2026-08 stale link-state ghost incident "
+            "(the vantage's hub bridge sat wedged ESTABLISHED with no real "
+            "transport for ~15 h, invisible to ssh_healthy), the detector "
+            "consumes the external vantage-health monitor's status feed to "
+            "know when vantage-derived signals are suspect. 'unknown' means "
+            "the feed itself is missing/stale — the monitor's own "
+            "dead-man's-switch pages separately.\n")
+        return self._dispatch_email(
+            EmailCategory.VANTAGE_TRUST, subject=subject, body=body)
+
+    def send_keyed_listener_alert(self, node: int, reason: str, strikes: int,
+                                  already_vetoed: bool = False) -> bool:
+        """Step 2 trigger B (2026-09-07): internal note that a permitted
+        listener was seen KEYED toward the vantage and had its listener
+        status refused. Sent even when no violation follows (a listener with
+        no outside branches raises none — audit S3). Bennett-only, LISTENER
+        category policy (respects quiet hours, bypasses dry-run)."""
+        subject = (f"LISTENER KEYED: node {node} refused listener status "
+                   f"(veto #{strikes}{', renewed' if already_vetoed else ''})")
+        body = (
+            f"The vantage node saw permitted listener {node} KEYED toward it. "
+            f"A true monitor-only link never keys toward the monitored node, "
+            f"so this contradicts the node's own link-mode report.\n\n"
+            f"Detail: {reason}\n\n"
+            f"Effect: the node's listener status is refused until the veto "
+            f"expires (listeners.keyed_veto_ttl_seconds; renewed on every "
+            f"further keyup) and an immediate scan was requested. If the node "
+            f"has outside links, that scan takes the normal violation path "
+            f"(email + auto-disconnect through the usual rails); if it has "
+            f"none, nothing else happens — this note is the only record.\n"
+            f"See /status listeners.keyed_vetoes.\n")
+        return self._dispatch_email(
+            EmailCategory.LISTENER_NOTICE, subject=subject, body=body)
+
+    def send_dark_guest_notice(self, rec: dict) -> bool:
+        """Step 2b: low-rate trustee notice about a dark guest (cadence is
+        enforced by DarkGuestTracker; a False return keeps it pending)."""
+        node, bridge = rec.get("node"), rec.get("bridge")
+        state = str(rec.get("state", "unverified")).upper()
+        sample = ", ".join(str(x) for x in (rec.get("foreign_sample") or [])[:8])
+        subject = (f"DARK GUEST ({state}): node {node} ({rec.get('callsign', '?')}) on "
+                   f"{rec.get('attachment', 'bridge')} {bridge} — link mode unknown")
+        ambiguous = state == "AMBIGUOUS"
+        body = (
+            f"Node {node} ({rec.get('callsign', '?')}) is linked to our "
+            f"{rec.get('attachment', 'bridge')} node {bridge} and is ONLINE, but it "
+            f"posts nothing to stats.allstarlink.org, so this monitoring system "
+            f"cannot read its link list or its link modes.\n\n"
+            + (f"These outside AllStar nodes post a status record that reports a "
+               f"link to node {node}: "
+               f"{', '.join(str(x) for x in (rec.get('attributed') or [])[:8])}. "
+               f"Node {bridge}'s own learned-node list confirms they are in the mesh, "
+               f"on {rec.get('consecutive', 0)} consecutive scans. "
+               if rec.get("evidence") == "attributed" and rec.get("attributed") else
+               f"Node {bridge}'s own learned-node list shows {rec.get('foreign_count', 0)} "
+               f"entries the stats view cannot account for (sample: {sample or 'n/a'}), "
+               f"on {rec.get('consecutive', 0)} consecutive scans. ")
+            + ("More than one guest hangs off node {b}, so which guest carries them "
+               "cannot be determined from here — NOTICE ONLY, no automatic "
+               "action.\n\n".format(b=bridge) if ambiguous else
+               "That points to this node carrying other AllStar systems into "
+               "ours.\n\n")
+            + "Because its link mode is unknown, the node is being given the "
+            "benefit of the doubt: it may be listening only. "
+            + ("" if ambiguous else
+               f"If it transmits toward node {bridge} (two separate key-ups) while in "
+               f"this state, the system treats that as a bridge in use and disconnects "
+               f"it through node {bridge} after a fresh re-check of the same evidence "
+               f"(the usual rails apply: re-verify, cooldown, flag file).\n\n")
+            + "Why nodes are dark: status posting is OFF by default on HamVoIP "
+            "(two statpost lines to uncomment in rpt.conf) and on hand-configured "
+            "ASL3 nodes (the node-setup wizard asks 'Enable status posting'). "
+            "Darkness is not proof of intent.\n\n"
+            f"This notice repeats at most once per node per notice interval.\n")
+        return self._dispatch_email(
+            EmailCategory.DARK_GUEST_NOTICE, subject=subject, body=body)
+
+    def send_dark_guest_action(self, rec: dict, reason: str, action: str,
+                               message: str = "") -> bool:
+        """Step 2b: record of a keyed dark guest and what was done."""
+        node, bridge = rec.get("node"), rec.get("bridge")
+        subject = (f"DARK GUEST KEYED: node {node} ({rec.get('callsign', '?')}) "
+                   f"via {bridge} — {action}")
+        body = (
+            f"Dark guest {node} ({rec.get('callsign', '?')}) keyed toward our node "
+            f"{bridge} while node {bridge}'s learned-node list still carried "
+            f"entries the stats view cannot account for — a bridge in use.\n\n"
+            f"Evidence: {reason}\n\n"
+            f"Action: {action}\n"
+            f"Detail: {(message or '')[:300]}\n\n"
+            f"The node cannot be read on stats.allstarlink.org, so no link-mode "
+            f"letters are available and no courtesy note can be addressed from "
+            f"a stats record; the operator can be reached via QRZ.\n")
+        return self._dispatch_email(
+            EmailCategory.DARK_GUEST_ACTION, subject=subject, body=body)
+
+    def send_listener_notice(self, listeners: list, mesh_count: Optional[int],
+                             unaccounted: Optional[int], system_count: int,
+                             interval_hours: float,
+                             allowance: Optional[int] = None,
+                             suppressed_alerts: int = 0) -> bool:
+        """Phase 2 (2026-09-07): infrequent internal note while a permitted
+        listener with outside branches is present. Returns the dispatcher's
+        verdict so the caller keeps the notice pending on a refused send."""
+        lines = []
+        for l in listeners:
+            mon = ", ".join(str(m) for m in l.get("monitored") or []) or "(none live)"
+            lines.append(
+                f"  - node {l.get('node')} ({l.get('callsign', '?')}) is monitor-only "
+                f"to {l.get('attachment', '?')} {l.get('attached_to')} and to outside "
+                f"node(s) {mon}")
+        subject = (f"Listener present: {len(listeners)} permitted monitor-only "
+                   f"guest(s)")
+        mesh_line = (f"The vantage node's mesh list currently holds {mesh_count} "
+                     f"entries" if mesh_count is not None
+                     else "The vantage mesh count is unavailable this scan")
+        unac_line = (f"; {unaccounted} of them are entries the API topology cannot "
+                     f"account for (the mesh behind a monitor link is flat and "
+                     f"not attributable per node)" if unaccounted is not None
+                     else "")
+        body = (
+            "A guest whose every AllStar link is monitor-only (by its own "
+            "AllStarLink stats report) is attached to the system and is "
+            "permitted under the listener rule (listeners.permit: true).\n\n"
+            + "\n".join(lines) + "\n\n"
+            f"{mesh_line}{unac_line}. Supermon, *70 status and RPT_NUMLINKS "
+            f"count every mesh entry regardless of link mode, so their totals "
+            f"include nodes that can neither hear nor be heard by this system. "
+            f"System-reachable (transceive) nodes in the API topology: "
+            f"{system_count}.\n\n"
+            "The link-state watchdog is running against an allowance frozen "
+            "when the current listener set was registered"
+            + (f" ({allowance} entries)" if allowance is not None else "")
+            + "; it alarms again only if the foreign mesh count exceeds that "
+            "allowance plus the normal threshold. "
+            + (f"Watchdog alert emails withheld since registration: "
+               f"{suppressed_alerts} (see /status link_watchdog). "
+               if suppressed_alerts else "")
+            + "API detection continues every scan; link mode is the guest's "
+            "own report, unverified by this system, and a flip to transceive "
+            "is caught by the next full scan.\n\n"
+            f"This notice repeats at most every {interval_hours:g} hours while "
+            "a listener with outside branches is present.\n")
+        return self._dispatch_email(
+            EmailCategory.LISTENER_NOTICE, subject=subject, body=body)
+
+    def send_test_email(self) -> bool:
+        cfg = self.email_config
+        if not cfg.get("enabled", False):
+            logger.error("Email notifications are not enabled in config.")
+            return False
+        for field in ("username", "password"):
+            if not cfg.get(field):
+                logger.error("Email config missing required field: %s", field)
+                return False
+        body = (
+            "ASL Intersystem Link Detector — SMTP Test\n"
+            "==========================================\n\n"
+            "This is a test message confirming SMTP configuration.\n"
+            f"SMTP server: {cfg['smtp_server']}:{cfg.get('smtp_port', 587)}\n"
+            "If you received this, email alerts are working.\n\n"
+            "---\n"
+            "ASL Intersystem Link Detector\n"
+        )
+        return self._dispatch_email(
+            EmailCategory.TEST,
+            subject="Test — SMTP configuration verified",
+            body=body,
+        )
+
+    # ==================================================================
+    # New path — ERROR_REPORT (Bennett-only, capped, bypasses quiet hours)
+    # ==================================================================
+
+    def report_error(self, subject: str, body: str,
+                     exc: Optional[BaseException] = None) -> bool:
+        """Send a daemon-level error report to Bennett. Capped at
+        error_report_max_per_day per 24h to prevent a self-induced flood
+        from a tight error loop. Bypasses quiet hours by category policy
+        (so Bennett sees real problems when they happen)."""
+        # Volume cap.
+        try:
+            sent_24h = self.tracker.count_last_24h(
+                notification_type='error_report')
+        except Exception as e:
+            logger.error("ERROR_REPORT volume-cap query failed: %s — "
+                         "logging only.", e)
+            return False
+        if sent_24h >= self.error_report_max_per_day:
+            logger.warning(
+                "ERROR_REPORT cap reached (%d/24h) — error logged but not "
+                "emailed: %s", self.error_report_max_per_day, subject
+            )
+            return False
+
+        full_body = body
+        if exc is not None:
+            import traceback
+            full_body += "\n\nException:\n" + "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
+        return self._dispatch_email(
+            EmailCategory.ERROR_REPORT,
+            subject=f"ERROR — {subject}",
+            body=full_body,
+        )
+
+    # ==================================================================
+    # New path — ANALYTICS (Bennett-only periodic health digest)
+    # ==================================================================
+
+    def send_analytics_report(self, subject: str, text_body: str,
+                              html_body: Optional[str] = None) -> bool:
+        """Send the periodic network-health digest to Bennett only.
+
+        Routed through the chokepoint under EmailCategory.ANALYTICS:
+        internal_recipients only (never external), not rate-limited against
+        violation/alert traffic, and — by category policy — sends regardless
+        of quiet hours and monitor_only/dry-run (it is a read-only Bennett-only
+        digest, typically generated by the standalone analytics_report.py
+        process which never clears the fail-closed dry_run default)."""
+        return self._dispatch_email(
+            EmailCategory.ANALYTICS,
+            subject=subject,
+            body=text_body,
+            html_body=html_body,
+        )
+
+    # ==================================================================
+    # Email body formatters (unchanged from prior version)
+    # ==================================================================
+
+    def _format_offender_email(self, event: BridgingEvent,
+                                scan_result: ScanResult,
+                                offender_name: str, callsign: str) -> str:
+        template = self._load_offender_template()
+        return template.format(
+            offender_name=offender_name,
+            callsign=callsign,
+            offending_node=event.offending_node,
+            path_description=event.path_description,
+        )
+
+    def _load_offender_template(self) -> str:
+        template_path = Path(__file__).parent / "offender_email_draft.txt"
+        if template_path.exists():
+            try:
+                return template_path.read_text()
+            except Exception as e:
+                logger.warning("Could not read offender template: %s", e)
+        return """Hello {offender_name} ({callsign}),
+
+This is an automated notice from our repeater system.
+
+Our monitoring system has detected that your node {offending_node}
+is currently (or was recently) connected to our system while
+also having a connection to another AllStarLink network node:
+
+  Connection path: {path_description}
+
+Such bridging can create confusion and chaos unless previously
+discussed and authorized by the system trustee.
+
+When connecting to our system always "Disconnect before Connect."
+This will ensure that your node has no other active connections
+when linking to our repeater system.
+
+It's possible we have already disconnected your node. You are welcome
+to reconnect after clearing your other connections. If a connection
+was made with a permanent-link command (*812, *813 or *818), the
+normal *1 disconnect will not release it; use *811 followed by the
+node number.
+
+If you believe this notice was sent in error, or if you have
+questions, please contact the repeater support team.
+
+73
+"""
+
+    @staticmethod
+    def _format_action_section(event: BridgingEvent, disc_result) -> str:
+        """The action block of the sysadmin email. Describes what the
+        detector actually DID (2026-07-17, Bennett's wording feedback);
+        the pre-auto-disconnect 'RECOMMENDED ACTION' text survives only as
+        the fallback for cases where nothing was done."""
+        recommend = f"""RECOMMENDED ACTION:
+  Node {event.offending_node} ({event.offending_callsign}) should disconnect
+  from all other nodes before connecting to this system.
+  ("Disconnect before connect" best practice.)"""
+        if disc_result is None:
+            return recommend
+        if disc_result.action == "disconnected":
+            return f"""ACTION TAKEN:
+  Node {disc_result.target_node} was AUTOMATICALLY DISCONNECTED from managed
+  node {disc_result.managed_node} after the violation persisted through the
+  re-verification delay. ({disc_result.message})
+  A courtesy notice with "disconnect before connect" guidance is also being
+  emailed to the offending operator (when a QRZ address is on file), and the
+  offender is under fast-poll watch for repeat offenses."""
+        if disc_result.action == "skipped_reverify":
+            msg = disc_result.message or ""
+            reason = getattr(disc_result, "reason", "") or ""
+            if not reason:   # older producers: classify by wording
+                reason = ("cleared" if any(s in msg for s in (
+                    "resolved on its own", "no longer connected", "not attached",
+                    "no remaining", "no AllStar links", "no longer in DNS"))
+                    else "query_failed" if "Could not query" in msg else "no_evidence")
+            if reason == "cleared":
+                return f"""ACTION TAKEN:
+  None needed — the offending link had already cleared by the time of the
+  re-verification check. ({msg})
+  The offender remains under fast-poll watch in case it returns."""
+            if reason == "query_failed":
+                return f"""AUTO-DISCONNECT NOT ATTEMPTED:
+  The re-verification could not read the records it needs. ({msg})
+{recommend}"""
+            # Coherence (2026-10-12): the evidence did not support a cut.
+            return f"""ACTION TAKEN:
+  None — at re-verification the evidence did not support a disconnect:
+  ({msg})
+  The offender remains under fast-poll watch; a later scan re-judges it
+  on a fresher record."""
+        if disc_result.action == "ssh_failed":
+            return f"""AUTO-DISCONNECT FAILED:
+  SSH to managed node {disc_result.managed_node} failed — the offending link
+  may still be up. ({disc_result.message})
+{recommend}"""
+        # skipped_disabled / skipped_flagfile / skipped_local_override /
+        # skipped_cooldown / anything future
+        return f"""AUTO-DISCONNECT SKIPPED ({disc_result.action}):
+  {disc_result.message}
+{recommend}"""
+
+    def _display_tz(self):
+        """Timezone for human-facing dates in email bodies. Reuses the
+        quiet-hours timezone (the operator's local zone); UTC on any error."""
+        try:
+            return ZoneInfo(self.quiet_config.get("timezone",
+                                                  "America/Chicago"))
+        except Exception:
+            return timezone.utc
+
+    def _format_offense_history(self, event: BridgingEvent,
+                                prior_episodes) -> str:
+        """OFFENSE HISTORY section for the sysadmin email (Bennett,
+        2026-07-17: cross-event repeat-offender awareness — informational
+        only, no enforcement change). prior_episodes is the (possibly empty)
+        list from analytics_db.prior_offense_episodes, or None when the
+        lookup was unavailable/failed — None omits the section entirely.
+        'On record' is deliberate: violation_events recording began
+        2026-07-02; older offenses are not in the DB."""
+        if prior_episodes is None:
+            return ""
+        if not prior_episodes:
+            return (f"\nOFFENSE HISTORY:\n"
+                    f"  No prior offense episodes on record for node "
+                    f"{event.offending_node}.\n")
+        tz = self._display_tz()
+        lines = [f"\nOFFENSE HISTORY:",
+                 f"  This is offense episode #{len(prior_episodes) + 1} on "
+                 f"record for node {event.offending_node}."]
+        lines.append("  Prior recorded episodes (local time):")
+        # Cap like dragged_list[:20]/non_allstar[:30] — a chronic offender
+        # must not grow this email without bound (audit 2026-07-17).
+        shown = prior_episodes[-10:]
+        if len(prior_episodes) > len(shown):
+            lines.append(f"    (... and {len(prior_episodes) - len(shown)} "
+                         f"earlier episode(s) not shown)")
+        for ep in shown:
+            when = ep["first"].astimezone(tz).strftime("%Y-%m-%d %H:%M %Z")
+            cs = ep["callsign"] or "callsign unknown"
+            lines.append(f"    - {when} (as {cs})")
+        return "\n".join(lines) + "\n"
+
+    def _format_email_body(self, event: BridgingEvent, scan_result: ScanResult,
+                           disc_result=None, prior_episodes=None) -> str:
+        dragged_in = [
+            f"  - Node {nid} ({info.get('callsign', '?')}, {info.get('location', '?')})"
+            for nid, info in scan_result.topology.items()
+            if info.get("role") == "dragged_in"
+        ]
+        dragged_list = "\n".join(dragged_in[:20]) if dragged_in else "  (none detected beyond the offending node)"
+
+        non_allstar_lines = []
+        for nid, info in scan_result.topology.items():
+            ct = info.get("client_type")
+            if ct == "echolink":
+                disp = info.get("callsign", "?")
+                parent = info.get("parent", "?")
+                el_id = disp.split("-", 1)[1] if disp.startswith("EchoLink-") else "?"
+                non_allstar_lines.append(
+                    f"  - {disp} on host node {parent}"
+                    f"\n      EchoLink endpoint (node ID {el_id}, via chan_echolink)"
+                )
+            elif ct == "webtransceiver_type":
+                disp = info.get("callsign", "?")
+                parent = info.get("parent", "?")
+                non_allstar_lines.append(
+                    f"  - '{disp}' on host node {parent}"
+                    f"\n      WebTransceiver-type IAX2 softclient"
+                    f"\n      (WebTransceiver / AllScan / RepeaterPhone / generic"
+                    f" softphone — not distinguishable from stats API alone)"
+                )
+        if non_allstar_lines:
+            non_allstar_section = "\n".join(non_allstar_lines[:30])
+        else:
+            non_allstar_section = "  (none observed in this scan)"
+
+        # Link modes as each node self-reports to AllStarLink stats (T
+        # transceive, R monitor, L local monitor, C connecting, ? not
+        # reported). Informational — detection does not use them.
+        link_modes = getattr(event, "link_modes", "") or ""
+        # Coherence (2026-10-12): the offender's own record is the evidence
+        # behind its outside link — say how fresh it was and what it said.
+        _pa = getattr(event, "guest_post_age_seconds", None)
+        _pt = getattr(event, "guest_post_time", None)
+        _raw = (getattr(event, "guest_raw_nodes", "") or "")[:200]
+        _inc = getattr(event, "incoherent_for_seconds", None)
+        try:
+            _pt_txt = (datetime.fromtimestamp(int(_pt), tz=timezone.utc)
+                       .strftime("%H:%M:%S UTC") if _pt else "unknown time")
+        except Exception:
+            _pt_txt = "unknown time"
+        evidence_lines = (
+            f"  Offender's own record at detection: posted "
+            f"{(f'{_pa:.0f} s' if isinstance(_pa, (int, float)) else '?')} before the "
+            f"fetch ({_pt_txt}); raw link list: '{_raw or '(empty)'}'\n")
+        if isinstance(_inc, (int, float)):      # not produced in v1; kept for compat
+            evidence_lines += (
+                f"  That record had not named the node the offender is attached to for "
+                f"{_inc:.0f} s before this event.\n")
+        link_mode_section = (
+            f"\nREPORTED LINK MODES (T transceive, R monitor, L local monitor,"
+            f" C connecting, ? unknown; each node's own report):\n"
+            f"  {link_modes}\n{evidence_lines}" if link_modes else "")
+        listener_clause = (
+            " Exception (listeners): a guest whose every AllStar link is\n"
+            "    monitor-only by its own report is permitted and is not a\n"
+            "    violation; this event did not meet that test."
+            if self.permit_listeners else "")
+
+        return f"""AllStarLink Unauthorized Bridging Alert
+========================================
+
+Detected at: {scan_result.timestamp}
+
+OFFENDING NODE: {event.offending_node}
+  Callsign:    {event.offending_callsign}
+  Location:    {event.offending_location}
+
+BRIDGING PATH:
+  {event.path_description}
+
+DETECTION RULE:
+  {event.rule} [1]
+{link_mode_section}{self._format_offense_history(event, prior_episodes)}
+The offending node at depth {event.depth} is creating an unauthorized bridge
+between this repeater system and other networks.
+
+ADDITIONAL NODES CONNECTED VIA THE UNAUTHORIZED BRIDGING:
+{dragged_list}
+
+NON-ALLSTAR ENDPOINTS OBSERVED IN THIS SCAN:
+{non_allstar_section}
+
+{self._format_action_section(event, disc_result)}
+
+---
+[1] Detection screens: the detector walks the system's connection graph
+    outward from the hub and applies two rules. Screen 1: any node three
+    or more hops from the hub is a violation (the system's approved shape
+    never extends that far). Screen 2: a non-bridge node connected to the
+    hub must be an endpoint (anything beyond it is a violation), and a
+    designated bridge node is allowed exactly one guest (anything beyond
+    that guest is a violation). The rule cited above is the one this
+    event matched.{listener_clause}
+
+This is an automated alert from the ASL Intersystem Link Detector.
+"""
+
+
+# ----------------------------------------------------------------------
+# Import-time self-check: enforce the "only the chokepoint calls
+# .sendmail()" invariant via AST. Counts actual Attribute call sites,
+# so this file's own assertion source doesn't trip the count.
+# Future maintainers: do NOT add another smtplib.SMTP(...).sendmail call.
+# ----------------------------------------------------------------------
+def _self_check_single_sendmail():
+    import ast as _ast
+    try:
+        tree = _ast.parse(Path(__file__).read_text())
+    except Exception as e:
+        # S-2 fix (2026-05-15 self-review): warn loudly so the operator
+        # notices that the chokepoint invariant is no longer enforced.
+        logger.warning(
+            "notifier.py: chokepoint AST self-check could not read source "
+            "(%s). The single-sendmail invariant is NOT being enforced at "
+            "import time. Verify by hand: only _dispatch_email should call "
+            ".sendmail().", e
+        )
+        return
+    callsites = []
+    for node in _ast.walk(tree):
+        if (isinstance(node, _ast.Call)
+                and isinstance(node.func, _ast.Attribute)
+                and node.func.attr == "sendmail"):
+            callsites.append(node.lineno)
+    if len(callsites) > 1:
+        raise RuntimeError(
+            f"notifier.py invariant violated: {len(callsites)} .sendmail() "
+            f"callsites at lines {callsites}; only _dispatch_email is permitted."
+        )
+
+
+_self_check_single_sendmail()
+
+
+def _selftest() -> int:
+    """Offline checks of the map-attachment cover text (no DB, no config,
+    no send): four attachment situations × two audiences."""
+    note = Notifier._map_attachment_note
+    off = Path("2026-01-01_00-00-00_event.jpg")
+    loc = Path("2026-01-01_00-00-00_event_local.png")
+    both_s = note(off, loc, False, True, "sysadmin")
+    both_o = note(off, loc, False, True, "offender")
+    local_s = note(loc, None, True, True, "sysadmin")
+    local_o = note(loc, None, True, True, "offender")
+    local_plain = note(loc, None, True, False, "sysadmin")
+    off_only = note(off, None, False, False, "sysadmin")
+    off_only_o = note(off, None, False, False, "offender")
+    checks = [
+        ("both/sysadmin names both files", off.name in both_s and loc.name in both_s),
+        ("both/sysadmin explains difference",
+         "shows monitor-only links as two-way" in both_s
+         and "open arrowhead pointing at the listening node" in both_s
+         and "self-report" in both_s),
+        ("official slot lost -> local named as the map",
+         loc.name in note(None, loc, False, True, "sysadmin")
+         and "open arrowhead" in note(None, loc, False, True, "sysadmin")),
+        ("external caveat scoped to the decision, not display",
+         "deciding whether to disconnect" in MONITOR_LINK_CAVEAT_EXTERNAL
+         and "does not yet distinguish" not in MONITOR_LINK_CAVEAT_EXTERNAL),
+        ("both/offender names both files", off.name in both_o and loc.name in both_o),
+        ("both/offender neutral (no 'self-report' ops phrasing)",
+         "self-report" not in both_o and "listening node" in both_o),
+        ("local-only + monitor: arrow sentence", "open arrowhead" in local_s
+         and loc.name in local_s and "did not capture" in local_s),
+        ("local-only offender + monitor", "open arrowhead" in local_o
+         and "for your reference" in local_o),
+        ("local-only, no monitor: unchanged sentence",
+         "open arrowhead" not in local_plain and "did not capture" in local_plain),
+        ("official only: unchanged sentence",
+         off_only == f"\nThe bubble map captured at scan time is attached as {off.name}.\n"),
+        ("official only offender: unchanged", "for your reference" in off_only_o
+         and "two-way" not in off_only_o),
+        ("no attachment: empty", note(None, None, False, True, "sysadmin") == ""),
+        ("caveat wording matches finding",
+         "shows monitor-only links as two-way" in MONITOR_LINK_CAVEAT_INTERNAL),
+        ("caveat category gate unchanged", set(_MONITOR_CAVEAT_BY_CATEGORY) == {
+            EmailCategory.VIOLATION_SYSADMIN, EmailCategory.REPEAT_OFFENDER,
+            EmailCategory.WATCHDOG_ACTION, EmailCategory.OFFENDER_COURTESY}),
+        # ---- phase 2 ----
+        ("listener rule text covers the same categories",
+         set(_LISTENER_RULE_BY_CATEGORY) == set(_MONITOR_CAVEAT_BY_CATEGORY)),
+        ("listener external text carries the switching sequence",
+         "disconnect your other links first" in LISTENER_RULE_EXTERNAL
+         and "disconnect from this system before reconnecting" in LISTENER_RULE_EXTERNAL),
+        ("LISTENER_NOTICE policy is internal-only",
+         CATEGORY_POLICY[EmailCategory.LISTENER_NOTICE]["allow_external"] is False
+         and CATEGORY_POLICY[EmailCategory.LISTENER_NOTICE]["bypass_dry_run"] is True),
+        ("text selection: permit on -> rule text per category",
+         link_mode_text(EmailCategory.OFFENDER_COURTESY, True, True) is LISTENER_RULE_EXTERNAL
+         and link_mode_text(EmailCategory.WATCHDOG_ACTION, True, True) is LISTENER_RULE_WATCHDOG
+         and link_mode_text(EmailCategory.VIOLATION_SYSADMIN, True, False) is LISTENER_RULE_INTERNAL),
+        ("text selection: permit off -> caveat only when enabled",
+         link_mode_text(EmailCategory.OFFENDER_COURTESY, False, True) is MONITOR_LINK_CAVEAT_EXTERNAL
+         and link_mode_text(EmailCategory.VIOLATION_SYSADMIN, False, False) is None
+         and link_mode_text(EmailCategory.ANALYTICS, True, True) is None),
+        ("watchdog rule text makes no 'this event' claim",
+         "this event" not in LISTENER_RULE_WATCHDOG and "allowance" in LISTENER_RULE_WATCHDOG),
+        ("permit truthiness is strict (is True)",
+         (({"listeners": {"permit": "false"}}).get("listeners") or {}).get("permit") is not True
+         and (({"listeners": {"permit": 1}}).get("listeners") or {}).get("permit") is not True),
+    ]
+    # Notice body composition (no send): stub the chokepoint on a bare instance.
+    n = Notifier.__new__(Notifier)
+    captured = {}
+    n._dispatch_email = lambda category, subject, body, **kw: (  # type: ignore[assignment]
+        captured.update(category=category, subject=subject, body=body) or True)
+    ok = n.send_listener_notice(
+        [{"node": 4000, "callsign": "QQ0QQL", "attachment": "bridge",
+          "attached_to": 2000, "monitored": [5000, 6000]}],
+        mesh_count=134, unaccounted=125, system_count=9, interval_hours=24,
+        allowance=125, suppressed_alerts=2)
+    checks += [
+        ("notice dispatches on LISTENER_NOTICE", ok
+         and captured.get("category") == EmailCategory.LISTENER_NOTICE),
+        ("notice names listener, counts, cadence, watchdog allowance",
+         "4000" in captured["body"] and "5000, 6000" in captured["body"]
+         and "134" in captured["body"] and "125" in captured["body"]
+         and "System-reachable (transceive) nodes in the API topology: 9" in captured["body"]
+         and "every 24 hours" in captured["body"]
+         and "allowance frozen" in captured["body"]
+         and "(125 entries)" in captured["body"]
+         and "withheld since registration: 2" in captured["body"]),
+        ("notice makes no per-node attribution claim",
+         "reachable only through" not in captured["body"]),
+    ]
+    # D2 (2026-09-08): courtesy-note gates, against a real tracker DB.
+    import tempfile, types as _types, os as _os
+    td = tempfile.mkdtemp()
+    d2 = Notifier.__new__(Notifier)
+    d2.tracker = NotificationTracker(_os.path.join(td, "t.db"))
+    d2.rate_limits = {"offender_courtesy_cooldown_minutes": 60}
+    ev = lambda tgt: BridgingEvent(
+        offending_node=4600, offending_callsign="QQ4QQ", offending_location="x",
+        path=[1000, 2000, 4600, tgt], path_description=f"1000 → 2000 → 4600 → {tgt}",
+        depth=2, rule="r")
+    done: set = set()
+    checks_d2 = [
+        ("D2: first event for an offender -> send",
+         d2._courtesy_skip_reason(ev(7100), {}, done) == ""),
+    ]
+    done.add(4600)
+    checks_d2.append(("D2: 2nd-4th events of the same scan -> one note only",
+                      "already sent" in d2._courtesy_skip_reason(ev(7200), {}, done)))
+    skipped = {4600: _types.SimpleNamespace(action="skipped_cooldown")}
+    checks_d2.append(("D2: re-detection with disconnect skipped for cooldown -> no note",
+                      "cooldown" in d2._courtesy_skip_reason(ev(7100), skipped, set())))
+    kept = {4600: _types.SimpleNamespace(action="disconnected")}
+    checks_d2.append(("D2: verified disconnect -> note allowed",
+                      d2._courtesy_skip_reason(ev(7100), kept, set()) == ""))
+    rid = d2.tracker.record_pending_notification(ev(7100), "offender_courtesy")
+    d2.tracker.mark_notification_status(rid, "sent")
+    checks_d2.append(("D2: a sent note within the per-offender cooldown blocks the next scan's",
+                      "per-offender" in d2._courtesy_skip_reason(ev(7100), {}, set())))
+    checks_d2.append(("D2: a different offender is unaffected",
+                      d2._courtesy_skip_reason(BridgingEvent(
+                          offending_node=70000, offending_callsign="X", offending_location="x",
+                          path=[1, 2, 70000, 3], path_description="p", depth=2, rule="r"),
+                          {}, set()) == ""))
+    d2.rate_limits = {"offender_courtesy_cooldown_minutes": 0}
+    checks_d2.append(("D2: cooldown 0 disables the cross-scan gate",
+                      d2._courtesy_skip_reason(ev(7100), {}, set()) == ""))
+    checks += checks_d2
+    # notifications.email.internal_only (2026-09-08): every category stays
+    # internal; the offender courtesy note is redirected. Fake SMTP captures
+    # the envelope; nothing leaves the machine.
+    import tempfile as _tf2
+    td2 = _tf2.mkdtemp()
+    sent = []
+    class _FakeSMTP:
+        def __init__(self, *a, **k): pass
+        def starttls(self): pass
+        def login(self, *a): pass
+        def sendmail(self, frm, rcpts, msg): sent.append(list(rcpts))
+        def quit(self): pass
+    global smtplib
+    _real_smtp = smtplib.SMTP
+    smtplib.SMTP = _FakeSMTP  # type: ignore[attr-defined]
+    try:
+        def _mk(flag, offender_notes=None, tag=""):
+            email = {"enabled": True, "smtp_server": "x", "username": "u", "password": "p",
+                     "from_addr": "f@example.com",
+                     "recipients": ["me@example.com", "t1@example.com", "t2@example.com"],
+                     "internal_recipients": ["me@example.com"]}
+            if flag is not None:
+                email["internal_only"] = flag
+            if offender_notes is not None:
+                email["internal_only_send_offender_notes"] = offender_notes
+            n = Notifier({"db_path": os.path.join(td2, f"n_{flag}{tag}.db"),
+                          "notifications": {"email": email}})
+            n.set_dry_run(False)
+            return n
+        n_on, n_off, n_str = _mk(True), _mk(None), _mk("true")
+        # internal_only_send_offender_notes (2026-09-10)
+        n_note = _mk(True, True, "_note")
+        n_note_str = _mk(True, "true", "_notestr")
+        n_note_off = _mk(None, True, "_noteoff")     # meaningless without internal_only
+        checks.append(("offender_notes: engages only with internal_only true AND the literal boolean true",
+                       n_note.internal_only_offender_notes
+                       and not n_note_str.internal_only_offender_notes
+                       and not n_note_off.internal_only_offender_notes
+                       and n_note._external_recipients == []))
+        sent.clear()
+        okn = n_note._dispatch_email(EmailCategory.OFFENDER_COURTESY, "s", "b",
+                                     offender_address="offender@example.com")
+        checks.append(("offender_notes: courtesy note goes to the OFFENDER, bcc internal, NO trustees",
+                       okn and sent == [["offender@example.com", "me@example.com"]]))
+        sent.clear()
+        okn2 = n_note._dispatch_email(EmailCategory.VIOLATION_SYSADMIN, "s", "b")
+        checks.append(("offender_notes: every other category still internal only",
+                       okn2 and sent == [["me@example.com"]]))
+        sent.clear()
+        okn3 = n_note._dispatch_email(EmailCategory.REPEAT_OFFENDER, "s", "b")
+        checks.append(("offender_notes: REPEAT_OFFENDER still internal only",
+                       okn3 and sent == [["me@example.com"]]))
+        # audit S1: the cap dropping every internal copy aborts the courtesy send
+        global apply_absolute_recipient_cap
+        _real_cap = apply_absolute_recipient_cap
+        apply_absolute_recipient_cap = lambda tr, rc, mx, wh, cat: (  # noqa: E731
+            [a for a in rc if a != "me@example.com"], False)
+        try:
+            sent.clear()
+            okn4 = n_note._dispatch_email(EmailCategory.OFFENDER_COURTESY, "s", "b",
+                                          offender_address="offender@example.com")
+            checks.append(("offender_notes: cap removing every internal copy -> courtesy "
+                           "note NOT sent to the offender (S1)",
+                           okn4 is False and sent == [] and n_note._email_healthy is False))
+        finally:
+            apply_absolute_recipient_cap = _real_cap
+        # audit S2: only a single plain address may become an offender To:
+        good = ["op@example.com", " Op.Name+tag@sub.example.org ", "a_b-c@x-y.co"]
+        bad = ["", None, "op@example.com, t1@example.com", "op@example.com;x@y.z",
+               "Name <op@example.com>", "op@example.com\r\nBcc: t1@example.com",
+               "op@localhost", "op@@example.com", "op example@x.com", "x" * 250 + "@e.com"]
+        checks.append(("offender_notes: is_plain_email_address accepts plain addresses",
+                       all(is_plain_email_address(a) for a in good)))
+        checks.append(("offender_notes: is_plain_email_address rejects lists, display names, "
+                       "header breaks, bare hosts (S2)",
+                       not any(is_plain_email_address(a) for a in bad)))
+        checks.append(("internal_only: externals stripped at construction",
+                       n_on.internal_only and n_on._external_recipients == []
+                       and not n_off.internal_only
+                       and n_off._external_recipients == ["t1@example.com", "t2@example.com"]))
+        checks.append(("internal_only: only the literal boolean true engages it",
+                       not n_str.internal_only and len(n_str._external_recipients) == 2))
+        sent.clear()
+        ok1 = n_on._dispatch_email(EmailCategory.VIOLATION_SYSADMIN, "s", "b")
+        checks.append(("internal_only: violation alert goes to internal only",
+                       ok1 and sent == [["me@example.com"]]))
+        sent.clear()
+        ok2 = n_on._dispatch_email(EmailCategory.OFFENDER_COURTESY, "s", "b",
+                                   offender_address="offender@example.com")
+        checks.append(("internal_only: courtesy note redirected to internal, offender NOT on the envelope",
+                       ok2 and sent == [["me@example.com"]]))
+        sent.clear()
+        ok3 = n_off._dispatch_email(EmailCategory.OFFENDER_COURTESY, "s", "b",
+                                    offender_address="offender@example.com")
+        checks.append(("internal_only off: courtesy note still goes to the offender + bcc",
+                       ok3 and sent and sent[0][0] == "offender@example.com"
+                       and "t1@example.com" in sent[0]))
+        sent.clear()
+        ok4 = n_on._dispatch_email(EmailCategory.REPEAT_OFFENDER, "s", "b")
+        checks.append(("internal_only: REPEAT_OFFENDER (external-cap bypass) still internal only",
+                       ok4 and sent == [["me@example.com"]]))
+        # ---- quiet-hours deferral (2026-10-12; round-2 audit shape) ----
+        # internal_only instance (audit S2): proves scope at delivery, not the cap.
+        n_q = _mk(True, None, "_deferred")
+        n_q.quiet_config = {"enabled": True, "start": "22:00", "end": "07:00",
+                            "timezone": "America/Chicago"}
+        n_q.error_report_max_per_day = 50      # several loss-path checks below each report (audit N7)
+        n_q.is_quiet_hours = lambda: True                      # it is night
+        sent.clear()
+        rid = n_q.tracker.record_pending_simple("violation", "deferred-test")
+        okq = n_q._dispatch_email(EmailCategory.VIOLATION_SYSADMIN, "late alert", "body v1",
+                                  tracker_row_id=rid)
+        qrows = n_q.tracker.fetch_deferred_queued(10)
+        trow = sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT status FROM notifications WHERE id=?", (rid,)).fetchone()
+        checks.append(("deferred: a quiet-hours VIOLATION_SYSADMIN is QUEUED, not sent, caller told "
+                       "ACCEPTED (True), tracker row 'deferred', counter 1",
+                       okq is True and n_q._last_dispatch_outcome == "deferred" and sent == []
+                       and len(qrows) == 1 and qrows[0]["subject"] == "late alert"
+                       and trow and trow[0] == "deferred" and n_q._deferred_queued == 1))
+        checks.append(("deferred: the deferred tracker row counts as notified (dedupe)",
+                       n_q.tracker.count_today("violation") >= 1))
+        okq2 = n_q._dispatch_email(EmailCategory.VIOLATION_SYSADMIN, "late alert", "body v2")
+        qrows2 = n_q.tracker.fetch_deferred_queued(10)
+        checks.append(("deferred: a repeat of the same (category, subject) COALESCES into the one "
+                       "row (count 2, latest body kept) — no overnight pile-up (C1/S1)",
+                       okq2 is True and len(qrows2) == 1 and qrows2[0]["count"] == 2
+                       and qrows2[0]["body"] == "body v2"))
+        okd = n_q._dispatch_email(EmailCategory.DARK_GUEST_NOTICE, "dark guest 123", "b")
+        okv = n_q._dispatch_email(EmailCategory.VANTAGE_TRUST, "vt", "b")
+        okc = n_q._dispatch_email(EmailCategory.OFFENDER_COURTESY, "c", "b",
+                                  offender_address="offender@example.com")
+        checks.append(("deferred: DARK_GUEST_NOTICE accepted+queued (its caller retries on False); "
+                       "VANTAGE_TRUST (own retry) still dropped; OFFENDER_COURTESY still bypasses",
+                       okd is True and okv is False and okc is True
+                       and len(n_q.tracker.fetch_deferred_queued(10)) == 2))
+        n_q._dispatch_email(EmailCategory.WATCHDOG_ACTION,
+                            "LINK-STATE WATCHDOG: 40 foreign entries (>= 25) — no_enforceable_candidate",
+                            "w1", _coalesce_key="no_enforceable_candidate|None")
+        n_q._dispatch_email(EmailCategory.WATCHDOG_ACTION,
+                            "LINK-STATE WATCHDOG: 55 foreign entries (>= 25) — no_enforceable_candidate",
+                            "w2", _coalesce_key="no_enforceable_candidate|None")
+        wrows = [r for r in n_q.tracker.fetch_deferred_queued(10) if r["category"] == "watchdog_action"]
+        checks.append(("deferred: WATCHDOG_ACTION coalesces on the caller's action|target key (its "
+                       "subject carries the count) — one row, latest subject, count 2",
+                       len(wrows) == 1 and wrows[0]["count"] == 2
+                       and wrows[0]["subject"].startswith("LINK-STATE WATCHDOG: 55")))
+        with sqlite3.connect(n_q.tracker.db_path) as _c:   # drop it so the later counts hold
+            _c.execute("DELETE FROM deferred_emails WHERE category='watchdog_action'")
+        sent.clear()
+        checks.append(("deferred: flush during quiet hours sends nothing",
+                       n_q.flush_deferred() == 0 and sent == []))
+        n_q.is_quiet_hours = lambda: False                     # morning
+        got = n_q.flush_deferred()
+        qrow = sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT status, attempts FROM deferred_emails WHERE id=?", (qrows[0]["id"],)).fetchone()
+        trow2 = sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT status FROM notifications WHERE id=?", (rid,)).fetchone()
+        checks.append(("deferred: after quiet hours ONE alert is delivered per call, to internal "
+                       "only (internal_only), row 'sent', tracker row 'sent', counter 1 left",
+                       got == 1 and sent == [["me@example.com"]] and qrow == ("sent", 1)
+                       and trow2[0] == "sent" and n_q._deferred_queued == 1))
+        sent.clear()
+        checks.append(("deferred: the second row waits for the spacing interval (C2)",
+                       n_q.flush_deferred() == 0 and sent == []))
+        n_q._deferred_hold_until = 0.0
+        got_b = n_q.flush_deferred()
+        checks.append(("deferred: ...and goes out once the spacing has elapsed",
+                       got_b == 1 and sent == [["me@example.com"]] and n_q._deferred_queued == 0))
+        # never widen: queued while internal-only, flipped to full scope before flush (S4)
+        n_w = _mk(None, None, "_widen")                       # externals t1/t2 live
+        n_w.quiet_config = dict(n_q.quiet_config)
+        n_w.is_quiet_hours = lambda: True
+        n_w._external_recipients = []                          # internal-only at enqueue time
+        n_w._dispatch_email(EmailCategory.VIOLATION_SYSADMIN, "narrow", "b")
+        n_w._external_recipients = ["t1@example.com", "t2@example.com"]   # config flipped overnight
+        n_w.is_quiet_hours = lambda: False
+        sent.clear()
+        gw = n_w.flush_deferred()
+        checks.append(("deferred: delivery never WIDENS the scope the alert was queued under (S4)",
+                       gw == 1 and sent == [["me@example.com"]]))
+        # refusal is not an attempt (C3): cap drops everyone -> row held, attempts 0, tracker row back to 'deferred'
+        n_q.is_quiet_hours = lambda: True
+        rid3 = n_q.tracker.record_pending_simple("violation", "refused-test")
+        n_q._dispatch_email(EmailCategory.VIOLATION_SYSADMIN, "capped", "b", tracker_row_id=rid3)
+        n_q.is_quiet_hours = lambda: False
+        n_q._deferred_hold_until = 0.0
+        _real_cap2 = apply_absolute_recipient_cap      # (global declared above)
+        apply_absolute_recipient_cap = lambda tr, rc, mx, wh, cat: ([], False)  # noqa: E731
+        try:
+            sent.clear()
+            gr = n_q.flush_deferred()
+        finally:
+            apply_absolute_recipient_cap = _real_cap2
+        r3 = sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT status, attempts FROM deferred_emails WHERE subject='capped'").fetchone()
+        t3 = sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT status FROM notifications WHERE id=?", (rid3,)).fetchone()[0]
+        checks.append(("deferred: a policy REFUSAL holds the row with attempts 0 and keeps the "
+                       "tracker row 'deferred' (C3)",
+                       gr == 0 and sent == [] and r3 == ("queued", 0) and t3 == "deferred"))
+        n_q._deferred_hold_until = 0.0
+        sent.clear()
+        checks.append(("deferred: ...and it is delivered on the next unrefused cycle",
+                       n_q.flush_deferred() == 1 and sent == [["me@example.com"]]))
+        # expiry: stale row -> 'expired', tracker row freed ('failed'), counter, ERROR_REPORT sent
+        rid4 = n_q.tracker.record_pending_simple("violation", "stale-test")
+        old_id, _ = n_q.tracker.enqueue_deferred("violation_sysadmin", "stale", "b", None, [], None, rid4)
+        with sqlite3.connect(n_q.tracker.db_path) as _c:
+            _c.execute("UPDATE deferred_emails SET created_at=? WHERE id=?",
+                       ((datetime.now(timezone.utc) - timedelta(hours=DEFERRED_MAX_AGE_HOURS + 1)).isoformat(), old_id))
+        n_q._deferred_hold_until = 0.0
+        sent.clear()
+        got2 = n_q.flush_deferred()
+        st = sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT status FROM deferred_emails WHERE id=?", (old_id,)).fetchone()[0]
+        t4 = sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT status FROM notifications WHERE id=?", (rid4,)).fetchone()[0]
+        checks.append(("deferred: a stale queued row expires unsent, frees its tracker row (S9), "
+                       "counts in /status and is REPORTED (S3)",
+                       got2 == 0 and st == "expired" and t4 == "failed" and n_q._deferred_expired == 1
+                       and sent == [["me@example.com"]]))   # the ERROR_REPORT
+        # transient SMTP failure: attempts climb, then 'failed' + report; a missing attachment is skipped
+        fid, _ = n_q.tracker.enqueue_deferred("violation_sysadmin", "flaky", "b", None,
+                                              ["/nonexistent/attachment.png"], None, None)
+        class _FailSMTP(_FakeSMTP):
+            def sendmail(self, *a): raise OSError("smtp down")
+        smtplib.SMTP = _FailSMTP  # type: ignore[attr-defined]
+        for _ in range(DEFERRED_MAX_ATTEMPTS):
+            n_q._deferred_hold_until = 0.0
+            n_q.flush_deferred()
+        smtplib.SMTP = _FakeSMTP  # type: ignore[attr-defined]
+        st2 = sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT status, attempts FROM deferred_emails WHERE id=?", (fid,)).fetchone()
+        checks.append(("deferred: transient SMTP failures retry up to the limit then mark 'failed' "
+                       "and count (S3)", st2 == ("failed", DEFERRED_MAX_ATTEMPTS) and n_q._deferred_failed == 1))
+        # poisoned row cannot wedge the queue (S6)
+        pid, _ = n_q.tracker.enqueue_deferred("violation_sysadmin", "poison", "b", None, [], None, None)
+        with sqlite3.connect(n_q.tracker.db_path) as _c:
+            _c.execute("UPDATE deferred_emails SET created_at='not-a-date' WHERE id=?", (pid,))
+        n_q._deferred_hold_until = 0.0
+        n_q.flush_deferred()
+        stp = sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT status FROM deferred_emails WHERE id=?", (pid,)).fetchone()[0]
+        checks.append(("deferred: a poisoned row is marked failed, not left to block the queue (S6)",
+                       stp == "failed" and n_q.tracker.count_deferred_queued() == 0))
+        # retention: old non-queued rows are pruned
+        with sqlite3.connect(n_q.tracker.db_path) as _c:
+            _c.execute("UPDATE deferred_emails SET updated_at=? WHERE id=?",
+                       ((datetime.now(timezone.utc) - timedelta(days=8)).isoformat(), pid))
+        n_q._deferred_hold_until = 0.0
+        n_q._deferred_last_prune = 0.0                        # the sweep is hourly (N6)
+        n_q.flush_deferred()
+        left = sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT COUNT(*) FROM deferred_emails WHERE id=?", (pid,)).fetchone()[0]
+        checks.append(("deferred: finished rows older than 7 days are pruned (S7)", left == 0))
+        # R2: coalescing with a NEW tracker row supersedes the old one (frees the daily budget)
+        n_q.is_quiet_hours = lambda: True
+        ra = n_q.tracker.record_pending_simple("violation", "r2-a")
+        rb = n_q.tracker.record_pending_simple("violation", "r2-b")
+        n_q._dispatch_email(EmailCategory.VIOLATION_SYSADMIN, "r2 node", "a", tracker_row_id=ra)
+        n_q._dispatch_email(EmailCategory.VIOLATION_SYSADMIN, "r2 node", "b", tracker_row_id=rb)
+        sa, sb = [sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT status FROM notifications WHERE id=?", (x,)).fetchone()[0] for x in (ra, rb)]
+        checks.append(("deferred: a coalesced repeat SUPERSEDES the previous tracker row (R2): "
+                       "old 'superseded', new 'deferred'", sa == "superseded" and sb == "deferred"))
+        # R6: same offender, different path -> two rows
+        n_q._dispatch_email(EmailCategory.VIOLATION_SYSADMIN, "r6 node 1", "p1", _coalesce_key="1|A")
+        n_q._dispatch_email(EmailCategory.VIOLATION_SYSADMIN, "r6 node 1", "p2", _coalesce_key="1|B")
+        r6 = [r for r in n_q.tracker.fetch_deferred_queued(20) if r["subject"] == "r6 node 1"]
+        checks.append(("deferred: the violation key is offender AND path (R6) — two rows", len(r6) == 2))
+        # R4: watchdog rows with different ACTIONS stay distinct
+        for subj, key in (("LINK-STATE WATCHDOG: 40 foreign entries (>= 25) — disconnected", "disconnected|4000"),
+                          ("LINK-STATE WATCHDOG: 44 foreign entries (>= 25) — disconnected", "disconnected|5000"),
+                          ("LINK-STATE WATCHDOG: 41 foreign entries (>= 25) — no_enforceable_candidate", "no_enforceable_candidate|None"),
+                          ("LINK-STATE WATCHDOG: 42 foreign entries (>= 25) — no_enforceable_candidate", "no_enforceable_candidate|None")):
+            n_q._dispatch_email(EmailCategory.WATCHDOG_ACTION, subj, "w", _coalesce_key=key)
+        r4 = [r for r in n_q.tracker.fetch_deferred_queued(20) if r["category"] == "watchdog_action"]
+        checks.append(("deferred: watchdog coalesces per ACTION and TARGET (R4) — two cuts of different "
+                       "nodes stay two rows, two notices fold into one",
+                       len(r4) == 3 and sorted(r["count"] for r in r4) == [1, 1, 2]))
+        # R3: a refused row does not block a deliverable one behind it
+        n_q.is_quiet_hours = lambda: False
+        n_q._deferred_hold_until = 0.0
+        n_q.set_dry_run(True)                                 # refuses VIOLATION rows; WATCHDOG bypasses dry-run
+        sent.clear()
+        g3 = n_q.flush_deferred()
+        n_q.set_dry_run(False)
+        checks.append(("deferred: a refused row does not block a deliverable newer row (R3)",
+                       g3 == 1 and len(sent) == 1))
+        # R1: a transient SMTP failure backs off DEFERRED_RETRY_SPACING_S instead of retrying next cycle
+        n_q._deferred_hold_until = 0.0
+        smtplib.SMTP = _FailSMTP  # type: ignore[attr-defined]
+        n_q.flush_deferred()
+        smtplib.SMTP = _FakeSMTP  # type: ignore[attr-defined]
+        checks.append(("deferred: an SMTP failure holds the queue for the retry spacing (R1)",
+                       n_q._deferred_hold_until - time.monotonic() > DEFERRED_MIN_SPACING_S))
+        # N3: a permanent SMTP rejection (5xx, row-specific) is lost at once, no hold, no retries.
+        # (Start from an empty queue: flush handles the OLDEST row first and stops after a loss.)
+        with sqlite3.connect(n_q.tracker.db_path) as _c:
+            _c.execute("DELETE FROM deferred_emails WHERE status='queued'")
+        n_q._deferred_hold_until = 0.0
+        big_id, _ = n_q.tracker.enqueue_deferred("violation_sysadmin", "too big", "b", None, [], None, None)
+        class _RejectSMTP(_FakeSMTP):
+            def sendmail(self, *a): raise smtplib.SMTPDataError(552, b"message size exceeds limit")
+        smtplib.SMTP = _RejectSMTP  # type: ignore[attr-defined]
+        n_q.flush_deferred()
+        smtplib.SMTP = _FakeSMTP  # type: ignore[attr-defined]
+        stb = sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT status, attempts FROM deferred_emails WHERE id=?", (big_id,)).fetchone()
+        checks.append(("deferred: a permanent 5xx rejection marks the row failed immediately and does not "
+                       "hold the queue (N3)",
+                       stb == ("failed", 1) and n_q._deferred_hold_until - time.monotonic() <= DEFERRED_MIN_SPACING_S))
+        # N3 round 4: 4xx (greylisting) is TRANSIENT; a refused SENDER is transient; all-recipients-5xx is
+        # permanent; and even a rejecting server loses at most ONE row per cycle.
+        n_q._deferred_hold_until = 0.0
+        g_id, _ = n_q.tracker.enqueue_deferred("violation_sysadmin", "greylisted", "b", None, [], None, None)
+        class _GreySMTP(_FakeSMTP):
+            def sendmail(self, *a): raise smtplib.SMTPDataError(451, b"try again later")
+        smtplib.SMTP = _GreySMTP  # type: ignore[attr-defined]
+        n_q.flush_deferred()
+        smtplib.SMTP = _FakeSMTP  # type: ignore[attr-defined]
+        stg = sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT status, attempts FROM deferred_emails WHERE id=?", (g_id,)).fetchone()
+        checks.append(("deferred: a 4xx (greylist) is TRANSIENT — row stays queued, 1 attempt, 600 s hold",
+                       stg == ("queued", 1) and n_q._deferred_hold_until - time.monotonic() > DEFERRED_MIN_SPACING_S))
+        n_q._deferred_hold_until = 0.0
+        class _SenderSMTP(_FakeSMTP):
+            def sendmail(self, *a): raise smtplib.SMTPSenderRefused(550, b"sender rejected", "f@example.com")
+        smtplib.SMTP = _SenderSMTP  # type: ignore[attr-defined]
+        n_q.flush_deferred()
+        smtplib.SMTP = _FakeSMTP  # type: ignore[attr-defined]
+        stg2 = sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT status, attempts FROM deferred_emails WHERE id=?", (g_id,)).fetchone()
+        checks.append(("deferred: a refused SENDER (even 5xx) is transient — it would hit every row",
+                       stg2 == ("queued", 2)))
+        n_q._deferred_hold_until = 0.0
+        class _BannerSMTP(_FakeSMTP):
+            def __init__(self, *a, **k): raise smtplib.SMTPConnectError(554, b"no service here")
+        smtplib.SMTP = _BannerSMTP  # type: ignore[attr-defined]
+        n_q.flush_deferred()
+        smtplib.SMTP = _FakeSMTP  # type: ignore[attr-defined]
+        stg3 = sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT status, attempts FROM deferred_emails WHERE id=?", (g_id,)).fetchone()
+        checks.append(("deferred: a 554 connect banner (IP-reputation block) is transient — row held, 600 s",
+                       stg3 == ("queued", 3) and n_q._deferred_hold_until - time.monotonic() > DEFERRED_MIN_SPACING_S))
+        n_q._deferred_hold_until = 0.0
+        r1_id, _ = n_q.tracker.enqueue_deferred("violation_sysadmin", "rcpt-a", "b", None, [], None, None)
+        class _RcptSMTP(_FakeSMTP):
+            def sendmail(self, frm, rcpts, msg): raise smtplib.SMTPRecipientsRefused({r: (550, b"no such user") for r in rcpts})
+        smtplib.SMTP = _RcptSMTP  # type: ignore[attr-defined]
+        n_q.flush_deferred()                                   # oldest row first = 'greylisted'
+        smtplib.SMTP = _FakeSMTP  # type: ignore[attr-defined]
+        rows_left = sqlite3.connect(n_q.tracker.db_path).execute(
+            "SELECT status FROM deferred_emails WHERE id IN (?,?) ORDER BY id", (g_id, r1_id)).fetchall()
+        checks.append(("deferred: all recipients 5xx is permanent, but a rejecting server loses at most ONE "
+                       "row per cycle (blast radius)",
+                       rows_left == [("failed",), ("queued",)]))
+        with sqlite3.connect(n_q.tracker.db_path) as _c:
+            _c.execute("DELETE FROM deferred_emails WHERE id=?", (r1_id,))
+        # R5: loss counters are table-derived and survive a rebuilt Notifier
+        lost_now = n_q.tracker.count_deferred_lost()
+        checks.append(("deferred: /status loss counters come from the table (R5)",
+                       n_q._deferred_expired == lost_now["expired"] and n_q._deferred_failed == lost_now["failed"]
+                       and lost_now["expired"] >= 1 and lost_now["failed"] >= 1))
+    finally:
+        smtplib.SMTP = _real_smtp  # type: ignore[attr-defined]
+        import shutil as _sh2; _sh2.rmtree(td2, ignore_errors=True)
+    import shutil as _sh; _sh.rmtree(td, ignore_errors=True)
+    failed = [n for n, ok in checks if not ok]
+    for n, ok in checks:
+        print(f"  [{'OK' if ok else 'FAIL'}] {n}")
+    print(f"notifier selftest: {len(checks) - len(failed)}/{len(checks)} passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    import sys
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest())
+    print("usage: python3 notifier.py --selftest")

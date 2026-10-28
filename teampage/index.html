@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Repeater Node Status</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <h1 id="title">Repeater system — node status</h1>
+  <div id="banner" class="banner banner-wait" role="status" aria-live="polite">Loading…</div>
+</header>
+
+<main>
+  <section class="summary" id="summary" aria-label="Summary"></section>
+
+  <section aria-labelledby="table-h">
+    <h2 id="table-h">All nodes</h2>
+    <div class="table-wrap">
+      <table class="status" id="status-table">
+        <thead>
+          <tr><th></th><th>Node</th><th>Description</th><th>Registered</th><th>Link</th><th>Posting</th><th>DNS</th></tr>
+        </thead>
+        <tbody id="status-rows"></tbody>
+      </table>
+    </div>
+    <p class="legend" id="legend"></p>
+  </section>
+
+  <div id="groups"></div>
+</main>
+
+<footer class="foot">
+  <p>Registered = checked in with AllStar (within the registration age limit). Link = what the parent node reports for its link to this node. Posting = the node's own stats post. DNS = registration records: ASL = &lt;node&gt;.nodes.allstarlink.org, HV = &lt;node&gt;.asl.hamvoip.org (required only for nodes that register with HamVoIP). Times shown as ages; the banner shows when the data was produced. Data: AllStarLink stats API and public DNS, assembled by the monitoring daemon.</p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

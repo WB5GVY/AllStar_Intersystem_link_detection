@@ -1,0 +1,460 @@
+# AllStar Intersystem Link Detection — Example Configuration
+# Copy this file to config.yaml and fill in your values.
+# See README.md for documentation.
+
+# Your system topology
+#
+# Focus node: the central hub node to monitor
+focus_node: XXXXX     # Replace with your hub node number
+#
+# Bridge nodes: permitted to have ONE guest node beyond them.
+# Regular 1-hop nodes (anything else connected to the focus) must be leaf endpoints.
+bridge_nodes:
+  - YYYYY   # Example: radioless bridge node
+  - ZZZZZ   # Example: secondary hub/bridge
+  - WWWWW   # Example: EchoLink gateway
+#
+# Detection rules:
+#   - Any node ≥3 hops from focus = ALWAYS problematic
+#   - Non-bridge 1-hop node with anything beyond it = problematic (hop 2 is offender)
+#   - Bridge node with >1 hop beyond it = problematic (hop 3 is offender)
+
+# Nodes that are explicitly allowed beyond normal limits (e.g., known legitimate).
+allowlist: []
+
+# How often to poll the AllStarLink Stats API (seconds).
+# The API allows 30 req/min aggregate; a 5-min interval is very conservative.
+poll_interval_seconds: 300
+
+# Aggressive polling near top of each hour.
+# Nets typically start at :00, so offenders are more likely to connect
+# in the minutes just before and after the hour.
+top_of_hour_polling:
+  enabled: true
+  interval_seconds: 15     # Poll every 15s during the window
+  before_minutes: 5        # Start aggressive polling at :55
+  after_minutes: 10        # End aggressive polling at :10
+
+# Consider a linked node "stale" if its regseconds timestamp is older than
+# this many minutes. Stale links are skipped (not flagged as bridging).
+# Note: the stats API's regseconds can lag ~60 min behind the live registration
+# server, so this threshold should be generous.
+stale_threshold_minutes: 120
+
+# A guest whose stats record is EMPTY (no links named) but was POSTED within
+# this many seconds, and which is registered in DNS, is "linkless" (it is
+# reporting, and reports no links — typically the attach-side link stuck
+# re-dialing after the guest's address changed) rather than a "dark guest"
+# (posting nothing). Nodes post every minute or so; keep this small: if the
+# stats server keeps serving a node's last record after it stops posting,
+# this is the longest such a node can go dark before dark-guest tracking
+# begins (confirmation then takes dark_guests.confirm_scans more scans).
+# 0 disables the classification (every empty record is dark). Default 600.
+# Shown in /status `linkless`.
+linkless_fresh_seconds: 600
+
+# Logging
+logging:
+  level: INFO          # DEBUG, INFO, WARNING, ERROR
+  file: asl_link_detector.log
+  max_bytes: 5242880   # 5 MB
+  backup_count: 3      # Keep 3 rotated log files
+
+# Secrets file — credentials stored separately (owner-read-only, chmod 600).
+# See secrets.yaml.example for the format.
+secrets_file: "~/.config/asl_link_detector/secrets.yaml"
+
+# Email notification via SMTP
+notifications:
+  email:
+    enabled: true
+    smtp_server: smtp.gmail.com
+    smtp_port: 587
+    use_tls: true
+    # username, password, from_addr, recipients loaded from secrets_file
+    subject_prefix: "[ASL Link Alert]"
+    # Keep EVERY category internal (trustees get nothing; the offender
+    # courtesy note is redirected to the internal recipients) — e.g. while a
+    # new revision earns trust. Literal boolean true only; SIGHUP applies.
+    internal_only: false
+    # While internal_only is true: send the offender courtesy note to the
+    # offender anyway (bcc internal). Trustees and every other category stay
+    # suppressed. Literal boolean true only; no effect when internal_only is
+    # false (the normal per-category routing already reaches the offender).
+    internal_only_send_offender_notes: false
+  # Append a note to violation / repeat-offender / watchdog emails (and a
+  # neutral sentence on the offender courtesy note) saying the detector
+  # cannot yet tell monitor-only (*2) links from transceive (*3) links.
+  # Set false once the detector becomes link-mode aware.
+  monitor_link_caveat: true
+
+# Phase 2 — permitted "listener" guests (trustee decision; default OFF).
+# A guest whose EVERY AllStar link is monitor-only (*2, receive-only) by its
+# own AllStarLink stats report — to the system node it hangs off AND to every
+# outside node — moves no audio across the system boundary and may be
+# permitted. Any transceive or unreported link anywhere disqualifies it.
+# Side effects while a listener is present: the vantage mesh (Supermon, *70,
+# RPT_NUMLINKS) still counts the outside mesh behind its monitor links; the
+# link-state watchdog runs on a frozen allowance. Link mode is self-reported
+# by the guest's node and re-read every scan. SIGHUP applies changes.
+listeners:
+  permit: false
+  notice_interval_hours: 24   # internal notice cadence while a listener with outside branches is present
+  # Step 2 trigger B: a permitted listener seen KEYED toward the vantage (a
+  # true monitor link never keys toward the monitored node) is refused
+  # listener status and scanned at once. Vantage-adjacent listeners only —
+  # guests on other bridges/the hub have no AMI feed and rely on the poll.
+  # A veto alone cuts nothing; a cut still needs outside links (a violation).
+  # Needs link_watch + ami_listener enabled (no AMI feed = trigger inert).
+  # Renewals (further keyups on a vetoed node) request no scan and at most one
+  # digest email per TTL; a refused email (quiet hours) is retried next scan.
+  keyed_veto_enabled: true
+  keyed_veto_confirm_keyups: 2  # K-bearing AMI frames >= 30 s apart before the veto; 1 = first keyup
+  keyed_veto_ttl_seconds: 900   # veto lifetime (renewed on every further keyup); lapses
+                                # once a scan has consulted it, or at 4x TTL regardless
+
+# Step 2b (2026-09-07, Bennett; rebuilt 2026-09-08 after two audits): "dark"
+# guests — online but posting nothing to stats.allstarlink.org (OFF by
+# default on HamVoIP and hand-built ASL3), so their outside links are
+# invisible to the stats screens. Evidence, from our own nodes, that such a
+# guest carries other systems into ours:
+#   attributed — foreign entries in its attach node's learned-node union that
+#                POST a record reporting a link to the guest (far end agrees);
+#   excess     — union foreign count minus the permitted-listener allowance at
+#                or above foreign_threshold, AND the guest hangs off a bridge
+#                (never the hub), AND no other managed node hosts a guest
+#                (a union lists the whole network, so it cannot say which
+#                bridge carries the excess — same rule as the watchdog).
+# Either on confirm_scans consecutive scans, with no other non-system node on
+# the same attach node -> UNVERIFIED: a low-rate trustee notice (benefit of
+# the doubt: it may be listening only). If it then KEYS toward that attach
+# node (needs an AMI feed from it — see ami_listener.vantages), it is cut
+# through that node on the watchdog's rails (still-connected check, fresh
+# union + far-end re-check, cooldown, flag file). monitor_only never cuts;
+# cut_on_keyed: false logs "would cut" (soak mode); the cut also needs
+# link_watch.watchdog.enabled (its metric). OFF unless enabled is exactly
+# true. Knobs reload on SIGHUP.
+dark_guests:
+  enabled: false
+  confirm_scans: 2
+  notice_interval_hours: 24
+  cut_on_keyed: false           # opt-in; false = soak (K logged as "would cut")
+  keyed_cut_confirm_keyups: 2   # K transitions on the attach node's feed before a cut
+  keyed_cut_confirm_window_seconds: 900
+  keyed_cut_cooldown_seconds: 120
+  min_attributed_links: 1       # far-end nodes (in DNS, fresh, not ours/allowlisted)
+                                # reporting a link to the guest
+  attribution_max_lookups: 10   # API calls per guest per scan for that check
+  # foreign_threshold: 25       # excess rule; default = link_watch.watchdog.foreign_threshold
+  max_dark_guests: 3            # more dark guests in one scan = stats hiccup, no state change
+  posting_grace_seconds: 3600   # a "dark" guest seen posting this recently = hiccup
+
+# Same-instant coherence (2026-10-12). A guest's outside link is evidence ONLY
+# when the guest's OWN stats record also names the node it is attached to. The
+# attach node's record and the guest's record come from two clocks: after a
+# "disconnect before connect" switch the stats API can serve the guest's
+# PRE-join record (naming the OLD network, not your bridge) for a minute or
+# more. Such a guest is `unconfirmed` (/status, log, daily digest): no event,
+# no cut, no email; one delayed re-scan after its next post. The re-verify
+# also refuses to cut on a record that does not name the managed node, on the
+# SAME post detection used, or when the live vantage mesh shows the guest but
+# none of its claimed outside nodes. Knobs reload on SIGHUP.
+coherence:
+  enabled: true
+  relook_delay_seconds: 100        # wait for the guest's next post + API lag
+  relook_node_cooldown_seconds: 300
+  relook_global_min_seconds: 60
+  max_unconfirmed_seconds: 240     # still incoherent and still attached after this: one WARNING,
+                                   # /status state "past_grace" — still NOT enforced
+  live_mesh_veto: true             # re-verify refuses a cut when the trusted vantage mesh shows the
+                                   # guest but none of its claimed outside nodes
+
+# Notification rate limiting
+rate_limits:
+  max_per_window: 2          # Max notifications per window across all paths
+  window_minutes: 15          # Window size in minutes
+  max_per_day: 24             # Max notifications per day across all paths
+  cooldown_per_path_minutes: 15  # Same violation path won't re-notify within this period
+  offender_courtesy_cooldown_minutes: 60  # one courtesy note per OFFENDER per this window
+                                          # (also: one per offender per scan, none on a
+                                          # re-detection skipped by the disconnect cooldown)
+  # ABSOLUTE per-recipient fail-safe: max emails to any single address per
+  # rolling window, ALL categories combined, no bypass. The final allowed
+  # email carries a rate-limit notice.
+  absolute_recipient_max_per_window: 18
+  absolute_recipient_window_hours: 6
+
+# Quiet hours — notifications are suppressed (events still logged)
+quiet_hours:
+  enabled: true
+  start: "22:00"
+  end: "07:00"
+  timezone: "America/Chicago"
+
+# Auto-disconnect: SSH into managed nodes to force-disconnect offenders.
+# Each node listed here must have SSH key access from this machine.
+# Only nodes with enabled: true will be acted on.
+auto_disconnect:
+  reverify_delay_seconds: 15   # Wait this long, then re-check before disconnecting
+  nodes:
+    - node_id: YYYYY           # Replace with your managed node number
+      ssh_host: "192.168.x.x"  # Replace with your node's IP address
+      ssh_user: "root"          # SSH username on the AllStar node
+      ssh_key: "~/.ssh/id_your_key"  # Path to SSH private key
+      ssh_port: 22              # SSH port (default 22)
+      enabled: false            # Set to true after testing
+
+# Read-only app_rpt link-state reader. Once per scan, SSH into the vantage
+# node and parse `rpt xnode` — the mesh list app_rpt itself sees, including
+# nodes the stats API cannot (unregistered nodes, EchoLink, IAX2 leaf
+# clients). Feeds the per-scan link count into analytics and violation
+# reporting. SSH creds are resolved from the matching auto_disconnect.nodes
+# entry; the reader is read-only by construction and fail-safe (any error
+# logs and the scan proceeds without it).
+rpt_reader:
+  enabled: false
+  vantage_node: YYYYY        # must match an auto_disconnect.nodes entry
+  timeout_seconds: 15
+
+# Between-scan link-count tripwire + post-violation watch mode.
+# Requires rpt_reader. A background thread polls the vantage node between
+# full scans; a link-count spike triggers an immediate out-of-cycle scan,
+# and after a violation the offender is fast-poll watched — verified
+# re-offenses are re-kicked and escalate to a REPEAT_OFFENDER alert
+# (bypasses quiet hours) at strike_threshold.
+link_watch:
+  enabled: false
+  poll_interval_seconds: 60       # tripwire sampling cadence
+  read_timeout_seconds: 10        # per-poll SSH read timeout
+  baseline_window_samples: 240    # rolling median window (~4 h at 60 s)
+  min_baseline_samples: 10        # samples needed before count tripwire arms
+  count_margin: 5                 # trip at count >= baseline + margin
+  rate_per_minute: 5              # trip when count rises this fast
+  trip_cooldown_seconds: 300      # min seconds between trips
+  watch_window_minutes: 45        # post-violation watch duration per offender
+  watch_poll_interval_seconds: 15 # fast poll while any watch is active
+  strike_threshold: 3             # verified re-offenses before escalation
+  stale_record_margin_seconds: 60 # a full-scan re-detection strikes only if the offender's
+                                  # record was fetched this long AFTER the cut and the absence
+  absent_confirm_polls: 2         # consecutive vantage reads without the offender before the
+                                  # watch arms (one truncated read must not arm it)
+  scan_on_mesh_change: true       # membership change -> one out-of-cycle full
+                                  # scan (fast map confirmation of joins)
+  mesh_change_scan_cooldown_seconds: 180  # API-load bound under flapping
+  scan_on_link_restart: true      # step 2 trigger A: an ESTABLISHED vantage link re-made
+                                  # with the SAME peer (reconnect counter up / uptime reset:
+                                  # a *2/*3/*75 mode change or a transport blip; AMI stays
+                                  # silent, membership unchanged) -> one out-of-cycle scan.
+                                  # Independent of scan_on_mesh_change, own cooldown below.
+  link_restart_scan_cooldown_seconds: 180
+  # Change 3 (2026-09-08): the permitted-listener allowance (how many foreign
+  # vantage-table entries the watchdog tolerates while listeners are present)
+  # is re-frozen when a listener's outside BRANCH set changes, may only RISE
+  # for listener_branch_settle_seconds after such a change (the far mesh lands
+  # in the vantage table seconds after the scan that first saw the branch;
+  # must exceed mesh_change_scan_cooldown_seconds + a scan), and never sits
+  # above the current foreign count. Re-freezes are spaced at least
+  # listener_branch_refreeze_min_seconds apart so a listener that adds/drops a
+  # link every scan cannot absorb ghost growth. A branch change that lands
+  # inside that spacing (blocked re-freeze) still re-opens the settle window
+  # so the mesh behind it can raise the allowance on a later unchanged scan
+  # (2026-09-08 soft spot). listener_branch_refreeze_min_seconds is clamped
+  # to 3600 — larger values would keep that window open indefinitely.
+  listener_branch_settle_seconds: 420
+  listener_branch_refreeze_min_seconds: 300
+
+# A guest's link still CONNECTING (dialled, not answered — the C mode letter
+# in its own stats post) carries no audio: for GraphAnalyzer.CONNECTING_GRACE_SECONDS
+# (600, in code) it neither disqualifies the guest as a listener nor counts as
+# bridging; the daemon re-scans ~75 s after first seeing it; after the grace a
+# still-C link is judged as established again. Shown in /status `connecting`.
+
+# AMI push listener: persistent Asterisk Manager Interface session to the
+# vantage node via an ssh tunnel. On app_rpt link-change events it wakes
+# link_watch immediately (seconds instead of the 60s poll). Requires
+# link_watch. AMI credentials go in secrets.yaml under `ami:`:
+#   ami:
+#     YYYYY:
+#       username: admin
+#       secret: "<manager.conf secret>"
+ami_listener:
+  enabled: false
+  vantage_node: YYYYY     # defaults to rpt_reader.vantage_node if omitted
+  local_port: 61220       # local end of the SSH tunnel
+  remote_port: 5038       # AMI port on the node (manager.conf)
+  # Step 2b: extra vantage feeds (one AMI session per node, each over its own
+  # SSH tunnel and local port). Per-node opt-out: enabled: false — e.g. when
+  # a node's sysadmin declines; an entry naming vantage_node itself with
+  # enabled: false switches the primary feed off too. A malformed entry is
+  # skipped on its own. The keyed triggers (listener veto, dark-guest cut)
+  # act only on guests adjacent to a node that has a feed here.
+  # vantages:
+  #   - node: ZZZZZ
+  #     enabled: true
+  #     local_port: 61221
+  qso_hold_seconds: 120   # unkeyed gap that ends a "QSO" for the activity
+                          # indicator (map caption + /status qso block)
+
+# Vantage-trust gating: consumes an EXTERNAL vantage-health monitor's status
+# file (atomic JSON rewrites; schema: timestamp, overall, silenced, checks{})
+# and derives ok/degraded/unknown/silenced trust for the vantage-derived
+# fast-detection signals (tripwire + link-state watchdog). Presentation +
+# internal transition emails only — never gates enforcement. Disabled unless
+# status_file is set.
+vantage_trust:
+  enabled: false
+  status_file: ""            # e.g. "~/Library/Application Support/<monitor>/status.json"
+  stale_after_s: 2400        # unknown when the source is older than this
+  degraded_overall: [alert, fatal]         # source overall values -> degraded
+  degraded_check_values: [alert, fatal, ghost]  # per-check values -> degraded
+                             # ("warn" excluded: producer hysteresis-pending)
+  watch_checks: []           # e.g. [link_YYYYY, ghost_YYYYY, chan_YYYYY] —
+                             # vantage-view checks; missing/unknown -> unknown
+  email_cooldown_s: 21600    # between delivered degradation emails
+
+# Local bubble-map renderer: Graphviz render of each scan's topology —
+# role-colored, violations in red, vantage-only nodes dotted, external
+# leaves dashed, optional cached QRZ operator names. Served at
+# GET /bubble.png on the status server. Requires graphviz installed.
+bubble_map:
+  enabled: false
+  engine: neato              # neato | twopi | dot | fdp | circo
+                             # neato: compact spring layout (recommended);
+                             # twopi: strict radial rings (longer branches)
+  output: bubble_maps_local/current.png
+  qrz_names: false           # annotate guests with QRZ operator names
+  qrz_lookups_per_scan: 3    # budget for cache misses per scan
+  render_timeout_seconds: 30 # twopi subprocess cap (presentation-only path)
+  node_info_ttl_days: 30     # disk cache of node freq/tone/latlon/callsign
+  refresh_on_link_change: true      # re-render when the link watcher sees the
+                                    # vantage mesh change (needs link_watch);
+                                    # arrivals appear dotted until next scan
+  refresh_min_interval_seconds: 10  # debounce for the above
+  # echolink_host: 12345     # optional: your EchoLink gateway node — an
+                             # unconfirmed EchoLink mesh entry attaches here
+                             # speculatively instead of to the vantage node
+  landscape_enabled: true    # ALSO render a wide variant -> /bubble_wide.png
+  landscape_ratio: 0.45      # height/width stretch target for the wide map
+  landscape_output: bubble_maps_local/current_wide.png
+  spread_enabled: true       # ALSO render airy prism-layout variants,
+                             # served via ?layout=spread on both endpoints
+
+# QRZ.com callsign lookup — looks up offending operator's email to send courtesy notice
+# Credentials loaded from secrets_file
+qrz:
+  enabled: false               # Requires QRZ XML subscription
+
+# Voice announcement injection (not yet implemented)
+voice_announcement:
+  enabled: false
+  ssh_host: ""
+  ssh_user: "repeater"
+  ssh_key: "~/.ssh/id_rsa"
+  announce_node: YYYYY
+
+# HTTP status server for Home Assistant dashboard integration.
+# Serves GET /status (full JSON) and GET /health (liveness check).
+# Binds to 0.0.0.0 for LAN access. Do not expose to the internet.
+status_server:
+  enabled: true
+  port: 61211
+  health_check_interval_seconds: 300  # SSH health + flag file checks (seconds)
+
+# Analytics: persist a per-scan observation time-series to a separate SQLite DB
+# for periodic health/usage reports (see analytics_report.py). Pure observation —
+# never affects detection. Roles default to: core = the focus hub only;
+# bridge = the bridge_nodes above (designated bridges); guest = everything else.
+# Optionally override the role sets with explicit node-id lists. Enabling or
+# disabling requires a daemon restart (role changes are picked up on SIGHUP).
+analytics:
+  enabled: false
+  db_path: analytics.db
+  system_name: ""            # your system name; appears in the report title (e.g. "ACME")
+  # Set the role buckets explicitly (recommended — they can differ from the
+  # detection bridge_nodes above; a node may be core yet ALSO act as a bridge):
+  # core_nodes: [HUB, MEMBER1, MEMBER2]   # focus hub + always-connected members
+  # bridge_nodes: [BRIDGE1, BRIDGE2]      # the designated bridge nodes
+
+# Three-state node health (2026-10-18): per monitored node, three INDEPENDENT
+# facts from the stats registry — registered (checked in with AllStar within
+# 90 min), posting (sent its own stats post within 10 min) and the LINK LETTER
+# its expected parent reports for it (T live, R rx-only, L local monitor,
+# C dialing / no audio, - not listed, ? parent data unavailable). Shown in
+# /status `node_health`, recorded as transitions in analytics.db (when
+# analytics is enabled) and summarised in the digest's "Registration & link
+# state" section. Pure observation; never alerts or disconnects. Zero extra
+# API requests for nodes the scan already fetched; a node its parent does not
+# list is fetched at most once per extra_fetch_interval_seconds (never during
+# the top-of-hour burst). Enabling / changing the node list needs a restart.
+node_health:
+  enabled: false
+  # node: expected parent ('self' for the hub). Without this map the hub is
+  # 'self' and the analytics core + bridge nodes hang off the hub; a node that
+  # sits behind a bridge must be listed with that bridge as its parent.
+  # nodes:
+  #   HUB: self
+  #   MEMBER1: HUB
+  #   BRIDGE1: HUB
+  #   GUESTNODE: BRIDGE1
+  registered_max_age_seconds: 5400   # 90 min (regseconds can lag the registry by ~60 min)
+  posting_max_age_seconds: 600       # 10 min (statpost_time default 60 s)
+  confirm_scans: 2                   # a change is recorded after this many consecutive scans
+  extra_fetch_interval_seconds: 300  # own-record fetch for an unlisted node at most this often
+  extra_fetch_max_per_scan: 8
+  # Registration DNS, both systems (2026-10-19): every scan looks up
+  # <node>.nodes.allstarlink.org (A + TXT "NN= IP= PT=") and
+  # <node>.asl.hamvoip.org (TXT "radio@ip:port/node,ip"; HamVoIP nodes only)
+  # and cross-checks A vs TXT vs the node's own stats record (ipaddr/port).
+  # /status node_health.nodes.<n>.dns carries both record sets + `issues`.
+  # (dns_lookups below switches both lookups.)
+  # Nodes that REGISTER WITH HamVoIP: their <n>.asl.hamvoip.org record must
+  # exist ("HamVoIP record missing" otherwise). Registering with HamVoIP is
+  # optional — many HamVoIP nodes register with allstarlink.org only — so a
+  # node's software version implies nothing: every unlisted node is "don't
+  # care" (its HamVoIP record is looked up and shown, never a finding).
+  # Node NUMBERS only (a list that parses to nothing is ignored with a warning).
+  # hamvoip_nodes: [12345, 23456]
+  dns_lookups: true                  # also note the DNS registration (TXT record) per node
+
+# ---------------------------------------------------------------------------
+# Team status page feed (public_export.py, 2026-10-20). After every scan the
+# daemon renders ONE small JSON document (schema 1) from /status — the same
+# three facts per node, DNS block and record facts the HA cards show — writes
+# it to <dir>/status.json and pushes it to ONE Azure blob with a WRITE-ONLY
+# SAS read from the login keychain. Push-only: nothing listens. The scan never
+# waits (worker thread; one PUT per min_interval_seconds at most). The page
+# itself (Azure Static Web Apps, invited users) reads the blob through a
+# small proxy — see Claude-shared/2026-10-20_1716_team_status_page_exporter_PLAN_v1.md
+# ---------------------------------------------------------------------------
+public_export:
+  enabled: false
+  dir: public_export                 # local copy (gitignored); the page can be tested against it
+  # The blob's https URL WITHOUT any query string (https://<account>.blob.core.windows.net/<container>/<blob>).
+  # The SAS is NEVER written here: install it once in the login keychain, then SIGHUP the daemon.
+  # Type the command with `-w` LAST and NO value so `security` prompts for it (nothing lands in shell
+  # history or `ps`); the daemon reads it through /usr/bin/security, so no python needs -T:
+  #   security add-generic-password -a "$USER" -s ASL_TEAM_STATUS_SAS -T /usr/bin/security -U -w
+  # blob_url: https://<account>.blob.core.windows.net/status/status.json
+  sas_keychain_item: ASL_TEAM_STATUS_SAS
+  min_interval_seconds: 60           # pushes at least this far apart (the :55-:10 burst scans every 15 s)
+  timeout_seconds: 10                # per PUT; one retry after 5 s; never delays a scan
+  stale_after_seconds: 900           # advisory for the page's "stale" banner (passed through)
+  tz: "America/Chicago"              # rev 6: IANA zone the reboot windows are written in; pages show clock times in it
+  # Display groups, in order. Each node once; a node not listed here is not
+  # exported. Omit `groups` to export every node_health node in one group.
+  groups:
+    - name: "Core system"
+      icon: hub
+      nodes:
+        - {node: 12345, description: "Hub VHF"}
+        - {node: 23456, description: "Spoke VHF", proxied: true, reboot_window: "02:00-02:10"}
+          # proxied: true = the spoke registers through the hub site's reverse proxy (its ASL A record is the
+          #   hub's address, its TXT port the hub router's forward) — pages show "proxied via hub" instead of
+          #   the "A differs from TXT" / "HamVoIP port ≠ ASL" notes, and warn only if its A record is not the hub's
+          # reboot_window: "HH:MM-HH:MM" local time = the node's scheduled daily reboot; a software restart
+          #   inside the window is routine, outside it the page flags it
+    - name: "Bridge nodes"
+      icon: bridge
+      nodes:
+        - {node: 34567, description: "Bridge", radioless: true}   # radioless: true = no RF receiver; pages hide RF activity (keytime) fields
+
